@@ -12,6 +12,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import yfinance as yf
+import pdfplumber
 
 STATE_PATH = Path("state.json")
 
@@ -240,8 +241,11 @@ def is_sq_near(today: date) -> Tuple[bool, int]:
     return (0 <= d <= SQ_NEAR_DAYS), d
 
 
-# ========= JPX 裁定取引 (Robust Ver. 3) =========
-def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
+# ========= JPX 裁定取引 (PDF Ver.) =========
+def fetch_latest_arbitrage_url(s: requests.Session) -> Tuple[date, str]:
+    """
+    JPXのページから最新の「裁定取引」PDFのURLを取得する。
+    """
     r = s.get(JPX_PROGRAM_URL, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
@@ -261,7 +265,7 @@ def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
         if m:
             y, mo, d = map(int, m.groups())
             dt = date(y, mo, d)
-            link = tr.find("a", href=re.compile(r"\.xls", re.IGNORECASE))
+            link = tr.find("a", href=re.compile(r"\.pdf", re.IGNORECASE))
             if link:
                 url = _abs_url(JPX_PROGRAM_URL, link["href"])
                 candidates.append((dt, url))
@@ -271,20 +275,20 @@ def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
     if not candidates:
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if not re.search(r"\.xls", href, re.IGNORECASE):
+            if not re.search(r"\.pdf", href, re.IGNORECASE):
                 continue
             
             url = _abs_url(JPX_PROGRAM_URL, href)
             filename = href.split("/")[-1]
             
-            # Pattern C: 20260116.xls
+            # Pattern C: 20260116.pdf
             m8 = re.search(r"(20\d{2})(\d{2})(\d{2})", filename)
             if m8:
                 y, mo, d = map(int, m8.groups())
                 candidates.append((date(y, mo, d), url))
                 continue
             
-            # Pattern D: 260116.xls (YYMMDD)
+            # Pattern D: 260116.pdf (YYMMDD)
             m6 = re.search(r"(\d{2})(\d{2})(\d{2})", filename)
             if m6:
                 y_short, mo, d = map(int, m6.groups())
@@ -294,7 +298,7 @@ def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
                     continue
 
     if not candidates:
-        raise RuntimeError("JPX program page: No arbitrage excel links found (all methods failed).")
+        raise RuntimeError("JPX program page: No arbitrage PDF links found.")
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0]
@@ -306,51 +310,71 @@ def download_bytes(s: requests.Session, url: str) -> bytes:
     return r.content
 
 
-def parse_arbitrage_excel(excel_bytes: bytes) -> Tuple[float, float]:
-    # Check if content is HTML
-    if excel_bytes.lstrip().startswith(b"<!DOCTYPE") or excel_bytes.lstrip().startswith(b"<html"):
-        raise RuntimeError("Downloaded content appears to be HTML, not Excel. (Possible anti-bot block or 404)")
+def extract_arbitrage_data_from_pdf(pdf_bytes: bytes) -> Tuple[float, float]:
+    """
+    裁定取引PDFから「裁定売り残」「裁定買い残」を抽出する。
+    ターゲット: 「2. 裁定取引に係る現物ポジション」の表にある「株数」行
+    """
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        # 全ページのテーブルを抽出して探索
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for table in tables:
+                # テーブル内の各行をチェック
+                for row in table:
+                    # Noneを除去して文字列化
+                    clean_row = [str(x).replace(",", "").replace(" ", "").strip() if x else "" for x in row]
+                    
+                    # 1列目が「株数」またはそれに類する行を探す
+                    if len(clean_row) > 0 and "株数" in clean_row[0]:
+                        # 数値が含まれる要素を抽出
+                        nums = []
+                        for cell in clean_row:
+                            # 数字のみ抽出（マイナス等は考慮しない、残高は正数前提）
+                            # ただしOCR等で改行が入る場合があるため "123\n456" 等もケア
+                            # ここでは単純に "1048783" のような数値を探す
+                            ms = re.findall(r"\d+", cell)
+                            # 連結して数値化（例: "1,048, 783" -> ["1048", "783"] -> 1048783）
+                            if ms:
+                                val_str = "".join(ms)
+                                try:
+                                    nums.append(float(val_str))
+                                except:
+                                    pass
+                        
+                        # 抽出できた数値の数で判定
+                        # 通常の並び: [株数, 売り当限, 売り合計, 売り翌限, 買い当限, 買い翌限, 買い合計]
+                        # 合計列は通常「売り合計」「買い合計」の2つが必要。
+                        # 数値リストの中で、売り残と買い残を特定する。
+                        # 経験則: 
+                        #   数値が2つしかない -> [売り合計, 買い合計] (簡易表)
+                        #   数値が5つ以上ある -> 詳細表。
+                        #     売り合計 = 前半の大きな値 (あるいは2番目)
+                        #     買い合計 = 最後の値 (あるいは最後から2番目)
+                        
+                        if len(nums) >= 2:
+                            # PDFの構造上、右端が「買い合計」、その少し左が「売り合計」であることが多い
+                            # 具体的には:
+                            #   Row: [株数, Sell_Near, Sell_Total, Sell_Far, Buy_Near, Buy_Far, Buy_Total]
+                            #   nums: [Sell_Near, Sell_Total, Sell_Far, Buy_Near, Buy_Far, Buy_Total] (0を除く)
+                            #   売り合計: nums[1] (Sell_Total)
+                            #   買い合計: nums[-1] (Buy_Total)
+                            
+                            # ただし、Sell_Farなどが0で省略されたり結合されたりする場合があるため、
+                            # より安全な策として「最後」を買い残、「真ん中あたり」を売り残と推定するが、
+                            # ここではPDFの典型的レイアウト（提供されたPDF）に従う。
+                            
+                            arb_buy = nums[-1]  # 最後の数値が買い残合計
+                            
+                            # 売り残は、数値が多ければ2番目、少なければ1番目
+                            if len(nums) >= 5:
+                                arb_sell = nums[1]
+                            else:
+                                arb_sell = nums[0]
+                                
+                            return arb_buy, arb_sell
 
-    bio = io.BytesIO(excel_bytes)
-
-    # シンプルに読み込み（xlrdがインストールされている前提）
-    # Pandasが自動で拡張子(.xls or .xlsx)を判別します
-    try:
-        df = pd.read_excel(bio)
-    except Exception as e:
-        if "xlrd" in str(e):
-            raise RuntimeError(
-                "Failed to parse Excel. It seems 'xlrd' is missing for .xls files. "
-                "Please add 'xlrd>=2.0.1' to your requirements.txt."
-            ) from e
-        raise RuntimeError(f"Excel parsing failed: {e}")
-
-    df.columns = [str(c).strip() for c in df.columns]
-
-    def find_col(patterns: List[str]) -> Optional[str]:
-        for c in df.columns:
-            if any(p in c for p in patterns):
-                return c
-        return None
-
-    buy_col = find_col(["裁定買", "買い残", "買残"])
-    sell_col = find_col(["裁定売", "売り残", "売残"])
-    if not buy_col or not sell_col:
-        raise RuntimeError(f"Arb columns not found: {list(df.columns)}")
-
-    def first_number(series: pd.Series) -> float:
-        for v in series.tolist():
-            if pd.isna(v):
-                continue
-            try:
-                return float(v)
-            except Exception:
-                continue
-        raise RuntimeError("No numeric value found in arbitrage sheet")
-
-    arb_buy = first_number(df[buy_col])
-    arb_sell = first_number(df[sell_col])
-    return arb_buy, arb_sell
+    raise RuntimeError("Arbitrage data (Buy/Sell positions) not found in PDF tables.")
 
 
 # ========= JPX 日報（プライム売買高）(Robust Ver. 3) =========
@@ -413,8 +437,6 @@ def fetch_latest_daily_pdf_url(s: requests.Session) -> Tuple[date, str]:
 
 
 def extract_prime_volume_from_pdf(pdf_bytes: bytes) -> float:
-    import pdfplumber
-
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         lines: List[str] = []
         for page in pdf.pages:
@@ -564,10 +586,10 @@ def main() -> None:
     s = sess()
     state = load_state()
 
-    # 1) 裁定残（最新分）
-    arb_dt, arb_url = fetch_latest_arbitrage_excel_url(s)
-    arb_xls = download_bytes(s, arb_url)
-    arb_buy, arb_sell = parse_arbitrage_excel(arb_xls)
+    # 1) 裁定残（最新分） PDF版
+    arb_dt, arb_url = fetch_latest_arbitrage_url(s)
+    arb_pdf = download_bytes(s, arb_url)
+    arb_buy, arb_sell = extract_arbitrage_data_from_pdf(arb_pdf)
 
     upsert_history(
         state,
@@ -578,7 +600,7 @@ def main() -> None:
             "arb_net": arb_buy - arb_sell,
             "prime_volume": None,
             "signals": {},
-            "src": {"arb_excel": arb_url},
+            "src": {"arb_pdf": arb_url},
         },
     )
 
