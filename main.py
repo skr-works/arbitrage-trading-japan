@@ -307,20 +307,22 @@ def download_bytes(s: requests.Session, url: str) -> bytes:
 
 
 def parse_arbitrage_excel(excel_bytes: bytes) -> Tuple[float, float]:
-    # Check if content is HTML (sometimes scraper gets blocked or 404)
+    # Check if content is HTML
     if excel_bytes.lstrip().startswith(b"<!DOCTYPE") or excel_bytes.lstrip().startswith(b"<html"):
         raise RuntimeError("Downloaded content appears to be HTML, not Excel. (Possible anti-bot block or 404)")
 
     bio = io.BytesIO(excel_bytes)
 
-    # 修正: .xls (Binary) を読む可能性があるため engine="openpyxl" を強制しない
-    # ※ .xls を読むには xlrd がインストールされている必要があります
+    # シンプルに読み込み（xlrdがインストールされている前提）
+    # Pandasが自動で拡張子(.xls or .xlsx)を判別します
     try:
         df = pd.read_excel(bio)
-    except ImportError:
-        raise RuntimeError("Parsing failed. For .xls files, please ensure 'xlrd' is installed (pip install xlrd>=2.0.1).")
     except Exception as e:
-        # 詳細なエラーを出してデバッグしやすくする
+        if "xlrd" in str(e):
+            raise RuntimeError(
+                "Failed to parse Excel. It seems 'xlrd' is missing for .xls files. "
+                "Please add 'xlrd>=2.0.1' to your requirements.txt."
+            ) from e
         raise RuntimeError(f"Excel parsing failed: {e}")
 
     df.columns = [str(c).strip() for c in df.columns]
