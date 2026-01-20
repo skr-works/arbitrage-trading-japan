@@ -240,7 +240,7 @@ def is_sq_near(today: date) -> Tuple[bool, int]:
     return (0 <= d <= SQ_NEAR_DAYS), d
 
 
-# ========= JPX 裁定取引 (Row Scanning Ver.) =========
+# ========= JPX 裁定取引 (Robust Ver. 2) =========
 def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
     r = s.get(JPX_PROGRAM_URL, timeout=30)
     r.raise_for_status()
@@ -248,25 +248,58 @@ def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
 
     candidates = []
 
-    # ページ内のすべての行(tr)を走査する
+    # Method 1: Row Scanning (Text based)
+    # 行ごとにテキスト(日付)とリンク(Excel)のセットを探す
     for tr in soup.find_all("tr"):
-        # 行全体のテキストから日付を探す (例: "2026年1月16日売買分")
         text = tr.get_text(" ", strip=True)
-        m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+        # normalize spaces
+        text = re.sub(r"\s+", " ", text)
+        
+        # Pattern A: 2026年1月16日
+        m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
+        # Pattern B: 2026/01/16
         if not m:
-            continue
+            m = re.search(r"(\d{4})/\s*(\d{1,2})/\s*(\d{1,2})", text)
+            
+        if m:
+            y, mo, d = map(int, m.groups())
+            dt = date(y, mo, d)
+            link = tr.find("a", href=re.compile(r"\.xls", re.IGNORECASE))
+            if link:
+                url = _abs_url(JPX_PROGRAM_URL, link["href"])
+                candidates.append((dt, url))
+                continue
 
-        y, mo, d = map(int, m.groups())
-        dt = date(y, mo, d)
-
-        # 同じ行内にある Excelリンク (.xls / .xlsx) を探す
-        link = tr.find("a", href=re.compile(r"\.xls", re.IGNORECASE))
-        if link:
-            url = _abs_url(JPX_PROGRAM_URL, link["href"])
-            candidates.append((dt, url))
+    # Method 2: Filename Scanning (Fallback)
+    # 行スキャンで見つからなかった場合（HTML構造の違い等）、すべてのリンクからファイル名の日付を推定
+    if not candidates:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not re.search(r"\.xls", href, re.IGNORECASE):
+                continue
+            
+            url = _abs_url(JPX_PROGRAM_URL, href)
+            filename = href.split("/")[-1]
+            
+            # Pattern C: 20260116.xls (YYYYMMDD)
+            m8 = re.search(r"(20\d{2})(\d{2})(\d{2})", filename)
+            if m8:
+                y, mo, d = map(int, m8.groups())
+                candidates.append((date(y, mo, d), url))
+                continue
+            
+            # Pattern D: 260116.xls (YYMMDD) -> JPX often uses this
+            m6 = re.search(r"(\d{2})(\d{2})(\d{2})", filename)
+            if m6:
+                y_short, mo, d = map(int, m6.groups())
+                # 年が20xx年と仮定。月日が妥当な範囲かチェック
+                if 1 <= mo <= 12 and 1 <= d <= 31:
+                    y = 2000 + y_short
+                    candidates.append((date(y, mo, d), url))
+                    continue
 
     if not candidates:
-        raise RuntimeError("JPX program page: No arbitrage excel links found (row-scanning failed).")
+        raise RuntimeError("JPX program page: No arbitrage excel links found (all methods failed).")
 
     # 日付の新しい順にソートして先頭を返す
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -311,7 +344,7 @@ def parse_arbitrage_excel(excel_bytes: bytes) -> Tuple[float, float]:
     return arb_buy, arb_sell
 
 
-# ========= JPX 日報（プライム売買高）(Row Scanning Ver.) =========
+# ========= JPX 日報（プライム売買高）(Robust Ver. 2) =========
 def fetch_latest_daily_pdf_url(s: requests.Session) -> Tuple[date, str]:
     r = s.get(JPX_DAILY_URL, timeout=30)
     r.raise_for_status()
@@ -319,30 +352,52 @@ def fetch_latest_daily_pdf_url(s: requests.Session) -> Tuple[date, str]:
 
     candidates = []
 
+    # Method 1: Row Scanning
     for tr in soup.find_all("tr"):
         text = tr.get_text(" ", strip=True)
+        text = re.sub(r"\s+", " ", text)
         
-        # 日付フォーマットはページによって異なる可能性があるため複数パターン試行
-        # パターン1: YYYY年MM月DD日
-        m1 = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
-        # パターン2: YYYY/MM/DD
-        m2 = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})", text)
-        
-        m = m1 or m2
+        m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
         if not m:
-            continue
+            m = re.search(r"(\d{4})/\s*(\d{1,2})/\s*(\d{1,2})", text)
         
-        y, mo, d = map(int, m.groups())
-        dt = date(y, mo, d)
+        if m:
+            y, mo, d = map(int, m.groups())
+            dt = date(y, mo, d)
+            link = tr.find("a", href=re.compile(r"\.pdf", re.IGNORECASE))
+            if link:
+                url = _abs_url(JPX_DAILY_URL, link["href"])
+                candidates.append((dt, url))
+                continue
 
-        # 同じ行内にある PDFリンク を探す
-        link = tr.find("a", href=re.compile(r"\.pdf", re.IGNORECASE))
-        if link:
-            url = _abs_url(JPX_DAILY_URL, link["href"])
-            candidates.append((dt, url))
+    # Method 2: Filename Scanning (Fallback)
+    if not candidates:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not re.search(r"\.pdf", href, re.IGNORECASE):
+                continue
+            
+            url = _abs_url(JPX_DAILY_URL, href)
+            filename = href.split("/")[-1]
+            
+            # Pattern C: 20260116.pdf
+            m8 = re.search(r"(20\d{2})(\d{2})(\d{2})", filename)
+            if m8:
+                y, mo, d = map(int, m8.groups())
+                candidates.append((date(y, mo, d), url))
+                continue
+
+            # Pattern D: 260116.pdf (YYMMDD)
+            m6 = re.search(r"(\d{2})(\d{2})(\d{2})", filename)
+            if m6:
+                y_short, mo, d = map(int, m6.groups())
+                if 1 <= mo <= 12 and 1 <= d <= 31:
+                    y = 2000 + y_short
+                    candidates.append((date(y, mo, d), url))
+                    continue
 
     if not candidates:
-        raise RuntimeError("JPX daily report page: No PDF links found (row-scanning failed).")
+        raise RuntimeError("JPX daily report page: No PDF links found (all methods failed).")
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0]
