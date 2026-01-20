@@ -246,27 +246,25 @@ def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
 
-    # 修正: 複数のテーブルがある可能性を考慮して find_all で探索
-    # 修正: 正規表現を緩和（「売買分」がなくても日付があればマッチさせる）
-    tables = soup.find_all("table")
-    if not tables:
+    table = soup.find("table")
+    if not table:
         raise RuntimeError("JPX program page: table not found")
 
-    for table in tables:
-        for tr in table.find_all("tr"):
-            text = tr.get_text(" ", strip=True)
-            # 例: "2026年1月20日" だけでもマッチさせる
-            m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
-            if not m:
-                continue
-            
-            y, mo, d = map(int, m.groups())
-            trade_dt = date(y, mo, d)
+    for tr in table.find_all("tr"):
+        text = tr.get_text(" ", strip=True)
+        m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日売買分", text)
+        if not m:
+            continue
+        y, mo, d = map(int, m.groups())
+        trade_dt = date(y, mo, d)
 
-            for a in tr.find_all("a", href=True):
-                href = a["href"]
-                if href.lower().endswith((".xls", ".xlsx")):
-                    return trade_dt, _abs_url(JPX_PROGRAM_URL, href)
+        for a in tr.find_all("a", href=True):
+            href = a["href"]
+            href_l = href.lower()
+
+            # ===== 修正点：拡張子が末尾に来ない（クエリ付き等）ケースを拾う =====
+            if re.search(r"\.xls[xm]?(?:$|\?)", href_l) or ("excel" in href_l) or ("xls" in href_l):
+                return trade_dt, _abs_url(JPX_PROGRAM_URL, href)
 
     raise RuntimeError("JPX program page: latest excel link not found")
 
@@ -315,23 +313,25 @@ def fetch_latest_daily_pdf_url(s: requests.Session) -> Tuple[date, str]:
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
 
-    tables = soup.find_all("table")
-    if not tables:
+    table = soup.find("table")
+    if not table:
         raise RuntimeError("JPX daily report page: table not found")
 
-    for table in tables:
-        for tr in table.find_all("tr"):
-            text = tr.get_text(" ", strip=True)
-            m = re.search(r"(\d{4})/(\d{2})/(\d{2})", text)
-            if not m:
-                continue
-            y, mo, d = map(int, m.groups())
-            report_dt = date(y, mo, d)
+    for tr in table.find_all("tr"):
+        text = tr.get_text(" ", strip=True)
+        m = re.search(r"(\d{4})/(\d{2})/(\d{2})", text)
+        if not m:
+            continue
+        y, mo, d = map(int, m.groups())
+        report_dt = date(y, mo, d)
 
-            for a in tr.find_all("a", href=True):
-                href = a["href"]
-                if href.lower().endswith(".pdf"):
-                    return report_dt, _abs_url(JPX_DAILY_URL, href)
+        for a in tr.find_all("a", href=True):
+            href = a["href"]
+            href_l = href.lower()
+
+            # ===== 修正点：pdfリンクもクエリ付き等を拾う =====
+            if re.search(r"\.pdf(?:$|\?)", href_l) or ("pdf" in href_l):
+                return report_dt, _abs_url(JPX_DAILY_URL, href)
 
     raise RuntimeError("JPX daily report page: latest pdf link not found")
 
