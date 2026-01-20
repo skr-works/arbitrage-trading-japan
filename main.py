@@ -240,33 +240,37 @@ def is_sq_near(today: date) -> Tuple[bool, int]:
     return (0 <= d <= SQ_NEAR_DAYS), d
 
 
-# ========= JPX 裁定取引 =========
+# ========= JPX 裁定取引 (Row Scanning Ver.) =========
 def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
     r = s.get(JPX_PROGRAM_URL, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
 
-    table = soup.find("table")
-    if not table:
-        raise RuntimeError("JPX program page: table not found")
+    candidates = []
 
-    for tr in table.find_all("tr"):
+    # ページ内のすべての行(tr)を走査する
+    for tr in soup.find_all("tr"):
+        # 行全体のテキストから日付を探す (例: "2026年1月16日売買分")
         text = tr.get_text(" ", strip=True)
-        m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日売買分", text)
+        m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
         if not m:
             continue
+
         y, mo, d = map(int, m.groups())
-        trade_dt = date(y, mo, d)
+        dt = date(y, mo, d)
 
-        for a in tr.find_all("a", href=True):
-            href = a["href"]
-            href_l = href.lower()
+        # 同じ行内にある Excelリンク (.xls / .xlsx) を探す
+        link = tr.find("a", href=re.compile(r"\.xls", re.IGNORECASE))
+        if link:
+            url = _abs_url(JPX_PROGRAM_URL, link["href"])
+            candidates.append((dt, url))
 
-            # ===== 修正点：拡張子が末尾に来ない（クエリ付き等）ケースを拾う =====
-            if re.search(r"\.xls[xm]?(?:$|\?)", href_l) or ("excel" in href_l) or ("xls" in href_l):
-                return trade_dt, _abs_url(JPX_PROGRAM_URL, href)
+    if not candidates:
+        raise RuntimeError("JPX program page: No arbitrage excel links found (row-scanning failed).")
 
-    raise RuntimeError("JPX program page: latest excel link not found")
+    # 日付の新しい順にソートして先頭を返す
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0]
 
 
 def download_bytes(s: requests.Session, url: str) -> bytes:
@@ -307,33 +311,41 @@ def parse_arbitrage_excel(excel_bytes: bytes) -> Tuple[float, float]:
     return arb_buy, arb_sell
 
 
-# ========= JPX 日報（プライム売買高） =========
+# ========= JPX 日報（プライム売買高）(Row Scanning Ver.) =========
 def fetch_latest_daily_pdf_url(s: requests.Session) -> Tuple[date, str]:
     r = s.get(JPX_DAILY_URL, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
 
-    table = soup.find("table")
-    if not table:
-        raise RuntimeError("JPX daily report page: table not found")
+    candidates = []
 
-    for tr in table.find_all("tr"):
+    for tr in soup.find_all("tr"):
         text = tr.get_text(" ", strip=True)
-        m = re.search(r"(\d{4})/(\d{2})/(\d{2})", text)
+        
+        # 日付フォーマットはページによって異なる可能性があるため複数パターン試行
+        # パターン1: YYYY年MM月DD日
+        m1 = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+        # パターン2: YYYY/MM/DD
+        m2 = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})", text)
+        
+        m = m1 or m2
         if not m:
             continue
+        
         y, mo, d = map(int, m.groups())
-        report_dt = date(y, mo, d)
+        dt = date(y, mo, d)
 
-        for a in tr.find_all("a", href=True):
-            href = a["href"]
-            href_l = href.lower()
+        # 同じ行内にある PDFリンク を探す
+        link = tr.find("a", href=re.compile(r"\.pdf", re.IGNORECASE))
+        if link:
+            url = _abs_url(JPX_DAILY_URL, link["href"])
+            candidates.append((dt, url))
 
-            # ===== 修正点：pdfリンクもクエリ付き等を拾う =====
-            if re.search(r"\.pdf(?:$|\?)", href_l) or ("pdf" in href_l):
-                return report_dt, _abs_url(JPX_DAILY_URL, href)
+    if not candidates:
+        raise RuntimeError("JPX daily report page: No PDF links found (row-scanning failed).")
 
-    raise RuntimeError("JPX daily report page: latest pdf link not found")
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0]
 
 
 def extract_prime_volume_from_pdf(pdf_bytes: bytes) -> float:
