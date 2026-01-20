@@ -26,7 +26,7 @@ SQ_NEAR_DAYS = 5
 
 # 指数高値圏（過去3年）判定
 INDEX_PCTL = 0.90  # 90%点
-INDEX_TICKER = os.getenv("INDEX_TICKER", "^N225")  # デフォ: 日経225。TOPIXにしたければ ^TOPX 等を設定
+INDEX_TICKER = os.getenv("INDEX_TICKER", "^N225")  # デフォ: 日経225
 INDEX_LOOKBACK = "3y"
 
 JPX_PROGRAM_URL = "https://www.jpx.co.jp/markets/statistics-equities/program/index.html"
@@ -50,7 +50,7 @@ def fmt_num(x) -> str:
 
 def pick_level(alert: bool, conds: Dict[str, bool]) -> Tuple[str, str]:
     """
-    LEVELのルール（固定）:
+    LEVELのルール:
       - LEVEL 3: ALERT=True
       - LEVEL 2: ALERT=False かつ 条件が2つ以上TRUE
       - LEVEL 1: それ以外
@@ -241,10 +241,11 @@ def is_sq_near(today: date) -> Tuple[bool, int]:
     return (0 <= d <= SQ_NEAR_DAYS), d
 
 
-# ========= JPX 裁定取引 (PDF Ver.) =========
-def fetch_latest_arbitrage_url(s: requests.Session) -> Tuple[date, str]:
+# ========= JPX 裁定取引 (PDF Version) =========
+def fetch_latest_arbitrage_pdf_url(s: requests.Session) -> Tuple[date, str]:
     """
     JPXのページから最新の「裁定取引」PDFのURLを取得する。
+    HTMLの行やリンク構造を走査して日付とPDFリンクのペアを探す。
     """
     r = s.get(JPX_PROGRAM_URL, timeout=30)
     r.raise_for_status()
@@ -252,12 +253,13 @@ def fetch_latest_arbitrage_url(s: requests.Session) -> Tuple[date, str]:
 
     candidates = []
 
-    # Method 1: Row Scanning (Text based)
+    # Method 1: Row Scanning (行ごとの走査)
     for tr in soup.find_all("tr"):
         text = tr.get_text(" ", strip=True)
+        # 空白文字を正規化
         text = re.sub(r"\s+", " ", text)
         
-        # Pattern A: 2026年1月16日
+        # 日付パターン: "2026年1月16日" or "2026/01/16"
         m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
         if not m:
             m = re.search(r"(\d{4})/\s*(\d{1,2})/\s*(\d{1,2})", text)
@@ -265,13 +267,14 @@ def fetch_latest_arbitrage_url(s: requests.Session) -> Tuple[date, str]:
         if m:
             y, mo, d = map(int, m.groups())
             dt = date(y, mo, d)
+            # 同じ行内のPDFリンクを探す
             link = tr.find("a", href=re.compile(r"\.pdf", re.IGNORECASE))
             if link:
                 url = _abs_url(JPX_PROGRAM_URL, link["href"])
                 candidates.append((dt, url))
                 continue
 
-    # Method 2: Filename Scanning (Fallback)
+    # Method 2: Filename Scanning (ファイル名からの推定)
     if not candidates:
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -300,6 +303,7 @@ def fetch_latest_arbitrage_url(s: requests.Session) -> Tuple[date, str]:
     if not candidates:
         raise RuntimeError("JPX program page: No arbitrage PDF links found.")
 
+    # 日付の降順でソートし、最新のものを返す
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0]
 
@@ -312,72 +316,61 @@ def download_bytes(s: requests.Session, url: str) -> bytes:
 
 def extract_arbitrage_data_from_pdf(pdf_bytes: bytes) -> Tuple[float, float]:
     """
-    裁定取引PDFから「裁定売り残」「裁定買い残」を抽出する。
-    ターゲット: 「2. 裁定取引に係る現物ポジション」の表にある「株数」行
+    指定されたロジックに基づいてPDFから「裁定売り残」「裁定買い残」を抽出する。
+    1. pdfplumberで表を抽出
+    2. 1列目が「株数」である行を探す
+    3. カンマとスペースを除去して数値化
+    4. インデックスに基づいて、売り残（前方）と買い残（後方）を取得
     """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # 全ページのテーブルを抽出して探索
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
-                # テーブル内の各行をチェック
                 for row in table:
-                    # Noneを除去して文字列化
-                    clean_row = [str(x).replace(",", "").replace(" ", "").strip() if x else "" for x in row]
+                    # Noneや改行をクリーニング
+                    clean_row = [str(cell).replace("\n", "").strip() if cell else "" for cell in row]
                     
-                    # 1列目が「株数」またはそれに類する行を探す
-                    if len(clean_row) > 0 and "株数" in clean_row[0]:
-                        # 数値が含まれる要素を抽出
-                        nums = []
-                        for cell in clean_row:
-                            # 数字のみ抽出（マイナス等は考慮しない、残高は正数前提）
-                            # ただしOCR等で改行が入る場合があるため "123\n456" 等もケア
-                            # ここでは単純に "1048783" のような数値を探す
-                            ms = re.findall(r"\d+", cell)
-                            # 連結して数値化（例: "1,048, 783" -> ["1048", "783"] -> 1048783）
-                            if ms:
-                                val_str = "".join(ms)
-                                try:
-                                    nums.append(float(val_str))
-                                except:
-                                    pass
+                    # 1. 行の特定: 1列目が「株数」
+                    if not clean_row or "株数" not in clean_row[0]:
+                        continue
+
+                    # 2. 値のクリーニングと数値化
+                    nums = []
+                    for cell in clean_row:
+                        # カンマとスペースを削除
+                        val_text = cell.replace(",", "").replace(" ", "")
+                        # 数字部分を抽出 (例: "69381" "1047021" など)
+                        # 小数点を含む可能性も考慮して抽出
+                        ms = re.findall(r"(\d+(?:\.\d+)?)", val_text)
+                        for m in ms:
+                            try:
+                                nums.append(float(m))
+                            except ValueError:
+                                pass
+                    
+                    # 3. 列のマッピング (指定ロジック)
+                    # numsには [株数(もし数値なら), 売り当限, 売り合計, 売り翌限, 買い当限, 買い翌限, 買い合計] の順で入るはず
+                    # 例: [69381, 69381, 0, 1047021, 1762, 1048783]
+                    
+                    if len(nums) >= 2:
+                        # 一番最後の数値 = 「買い残（合計）」
+                        arb_buy = nums[-1]
                         
-                        # 抽出できた数値の数で判定
-                        # 通常の並び: [株数, 売り当限, 売り合計, 売り翌限, 買い当限, 買い翌限, 買い合計]
-                        # 合計列は通常「売り合計」「買い合計」の2つが必要。
-                        # 数値リストの中で、売り残と買い残を特定する。
-                        # 経験則: 
-                        #   数値が2つしかない -> [売り合計, 買い合計] (簡易表)
-                        #   数値が5つ以上ある -> 詳細表。
-                        #     売り合計 = 前半の大きな値 (あるいは2番目)
-                        #     買い合計 = 最後の値 (あるいは最後から2番目)
-                        
+                        # 前から2番目(インデックス1)の数値 = 「売り残（合計）」
+                        # ※nums[0]は「売り当限」、nums[1]は「売り合計」となるのが一般的
+                        # リストの長さが十分にあるか確認
                         if len(nums) >= 2:
-                            # PDFの構造上、右端が「買い合計」、その少し左が「売り合計」であることが多い
-                            # 具体的には:
-                            #   Row: [株数, Sell_Near, Sell_Total, Sell_Far, Buy_Near, Buy_Far, Buy_Total]
-                            #   nums: [Sell_Near, Sell_Total, Sell_Far, Buy_Near, Buy_Far, Buy_Total] (0を除く)
-                            #   売り合計: nums[1] (Sell_Total)
-                            #   買い合計: nums[-1] (Buy_Total)
+                            arb_sell = nums[1]
+                        else:
+                            # 万が一数値が2つしかない場合は先頭を売り残とする
+                            arb_sell = nums[0]
                             
-                            # ただし、Sell_Farなどが0で省略されたり結合されたりする場合があるため、
-                            # より安全な策として「最後」を買い残、「真ん中あたり」を売り残と推定するが、
-                            # ここではPDFの典型的レイアウト（提供されたPDF）に従う。
-                            
-                            arb_buy = nums[-1]  # 最後の数値が買い残合計
-                            
-                            # 売り残は、数値が多ければ2番目、少なければ1番目
-                            if len(nums) >= 5:
-                                arb_sell = nums[1]
-                            else:
-                                arb_sell = nums[0]
-                                
-                            return arb_buy, arb_sell
+                        return arb_buy, arb_sell
 
-    raise RuntimeError("Arbitrage data (Buy/Sell positions) not found in PDF tables.")
+    raise RuntimeError("Arbitrage data (Buy/Sell positions) not found in PDF tables using 'Share count' row logic.")
 
 
-# ========= JPX 日報（プライム売買高）(Robust Ver. 3) =========
+# ========= JPX 日報（プライム売買高）(Robust Ver.) =========
 def fetch_latest_daily_pdf_url(s: requests.Session) -> Tuple[date, str]:
     r = s.get(JPX_DAILY_URL, timeout=30)
     r.raise_for_status()
@@ -430,36 +423,58 @@ def fetch_latest_daily_pdf_url(s: requests.Session) -> Tuple[date, str]:
                     continue
 
     if not candidates:
-        raise RuntimeError("JPX daily report page: No PDF links found (all methods failed).")
+        raise RuntimeError("JPX daily report page: No PDF links found.")
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0]
 
 
 def extract_prime_volume_from_pdf(pdf_bytes: bytes) -> float:
+    """
+    日報PDFから「プライム市場」の売買高を取得する。
+    ここでも表解析(extract_tables)を優先し、だめならテキスト解析へフォールバック。
+    """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        lines: List[str] = []
+        # 1. Table Extraction Strategy
         for page in pdf.pages:
-            t = page.extract_text() or ""
-            for ln in t.splitlines():
-                ln = ln.strip()
-                if ln:
-                    lines.append(ln)
+            tables = page.extract_tables()
+            for table in tables:
+                for row in table:
+                    # 行を正規化して結合
+                    clean_row = [str(x).replace("\n", "").strip() if x else "" for x in row]
+                    row_text = "".join(clean_row)
+                    
+                    if "プライム" in row_text or "Prime" in row_text:
+                        # 数値抽出
+                        nums = []
+                        for cell in clean_row:
+                            # 1,234 or 1234.56
+                            ms = re.findall(r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)", cell)
+                            for m in ms:
+                                try:
+                                    val = float(m.replace(",", ""))
+                                    nums.append(val)
+                                except:
+                                    continue
+                        if nums:
+                            # 一般的に売買高・売買代金の中で最大値を採用すれば大きく外さない
+                            return max(nums)
 
-    keys = ["プライム", "Prime", "東証プライム"]
-    for ln in lines:
-        if any(k in ln for k in keys):
-            nums = re.findall(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?", ln)
-            if not nums:
-                continue
-            vals = []
-            for s in nums:
-                try:
-                    vals.append(float(s.replace(",", "")))
-                except Exception:
-                    pass
-            if vals:
-                return max(vals)
+        # 2. Text Extraction Strategy (Fallback)
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                if "プライム" in line or "Prime" in line:
+                    matches = re.findall(r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)", line)
+                    nums = []
+                    for m in matches:
+                        try:
+                            val = float(m.replace(",", ""))
+                            nums.append(val)
+                        except:
+                            continue
+                    if nums:
+                        return max(nums)
 
     raise RuntimeError("Prime volume not found in daily PDF text")
 
@@ -587,9 +602,10 @@ def main() -> None:
     state = load_state()
 
     # 1) 裁定残（最新分） PDF版
-    arb_dt, arb_url = fetch_latest_arbitrage_url(s)
-    arb_pdf = download_bytes(s, arb_url)
-    arb_buy, arb_sell = extract_arbitrage_data_from_pdf(arb_pdf)
+    # ここでExcel用関数ではなく、PDF用関数を呼ぶ
+    arb_dt, arb_url = fetch_latest_arbitrage_pdf_url(s)
+    arb_pdf_bytes = download_bytes(s, arb_url)
+    arb_buy, arb_sell = extract_arbitrage_data_from_pdf(arb_pdf_bytes)
 
     upsert_history(
         state,
