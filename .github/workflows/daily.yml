@@ -2,7 +2,7 @@ name: daily-update
 
 on:
   schedule:
-    - cron: "10 16 * * 1-5"   # JST 01:10（UTC 16:10）平日
+    - cron: "6 7 * * 1-5"   # JST 01:10（UTC 16:10）平日
   workflow_dispatch:
 
 permissions:
