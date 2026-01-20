@@ -240,7 +240,7 @@ def is_sq_near(today: date) -> Tuple[bool, int]:
     return (0 <= d <= SQ_NEAR_DAYS), d
 
 
-# ========= JPX 裁定取引 (Robust Ver. 2) =========
+# ========= JPX 裁定取引 (Robust Ver. 3) =========
 def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
     r = s.get(JPX_PROGRAM_URL, timeout=30)
     r.raise_for_status()
@@ -249,15 +249,12 @@ def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
     candidates = []
 
     # Method 1: Row Scanning (Text based)
-    # 行ごとにテキスト(日付)とリンク(Excel)のセットを探す
     for tr in soup.find_all("tr"):
         text = tr.get_text(" ", strip=True)
-        # normalize spaces
         text = re.sub(r"\s+", " ", text)
         
         # Pattern A: 2026年1月16日
         m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
-        # Pattern B: 2026/01/16
         if not m:
             m = re.search(r"(\d{4})/\s*(\d{1,2})/\s*(\d{1,2})", text)
             
@@ -271,7 +268,6 @@ def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
                 continue
 
     # Method 2: Filename Scanning (Fallback)
-    # 行スキャンで見つからなかった場合（HTML構造の違い等）、すべてのリンクからファイル名の日付を推定
     if not candidates:
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -281,18 +277,17 @@ def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
             url = _abs_url(JPX_PROGRAM_URL, href)
             filename = href.split("/")[-1]
             
-            # Pattern C: 20260116.xls (YYYYMMDD)
+            # Pattern C: 20260116.xls
             m8 = re.search(r"(20\d{2})(\d{2})(\d{2})", filename)
             if m8:
                 y, mo, d = map(int, m8.groups())
                 candidates.append((date(y, mo, d), url))
                 continue
             
-            # Pattern D: 260116.xls (YYMMDD) -> JPX often uses this
+            # Pattern D: 260116.xls (YYMMDD)
             m6 = re.search(r"(\d{2})(\d{2})(\d{2})", filename)
             if m6:
                 y_short, mo, d = map(int, m6.groups())
-                # 年が20xx年と仮定。月日が妥当な範囲かチェック
                 if 1 <= mo <= 12 and 1 <= d <= 31:
                     y = 2000 + y_short
                     candidates.append((date(y, mo, d), url))
@@ -301,7 +296,6 @@ def fetch_latest_arbitrage_excel_url(s: requests.Session) -> Tuple[date, str]:
     if not candidates:
         raise RuntimeError("JPX program page: No arbitrage excel links found (all methods failed).")
 
-    # 日付の新しい順にソートして先頭を返す
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0]
 
@@ -313,8 +307,21 @@ def download_bytes(s: requests.Session, url: str) -> bytes:
 
 
 def parse_arbitrage_excel(excel_bytes: bytes) -> Tuple[float, float]:
+    # Check if content is HTML (sometimes scraper gets blocked or 404)
+    if excel_bytes.lstrip().startswith(b"<!DOCTYPE") or excel_bytes.lstrip().startswith(b"<html"):
+        raise RuntimeError("Downloaded content appears to be HTML, not Excel. (Possible anti-bot block or 404)")
+
     bio = io.BytesIO(excel_bytes)
-    df = pd.read_excel(bio, engine="openpyxl")
+
+    # 修正: .xls (Binary) を読む可能性があるため engine="openpyxl" を強制しない
+    # ※ .xls を読むには xlrd がインストールされている必要があります
+    try:
+        df = pd.read_excel(bio)
+    except ImportError:
+        raise RuntimeError("Parsing failed. For .xls files, please ensure 'xlrd' is installed (pip install xlrd>=2.0.1).")
+    except Exception as e:
+        # 詳細なエラーを出してデバッグしやすくする
+        raise RuntimeError(f"Excel parsing failed: {e}")
 
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -344,7 +351,7 @@ def parse_arbitrage_excel(excel_bytes: bytes) -> Tuple[float, float]:
     return arb_buy, arb_sell
 
 
-# ========= JPX 日報（プライム売買高）(Robust Ver. 2) =========
+# ========= JPX 日報（プライム売買高）(Robust Ver. 3) =========
 def fetch_latest_daily_pdf_url(s: requests.Session) -> Tuple[date, str]:
     r = s.get(JPX_DAILY_URL, timeout=30)
     r.raise_for_status()
@@ -370,7 +377,7 @@ def fetch_latest_daily_pdf_url(s: requests.Session) -> Tuple[date, str]:
                 candidates.append((dt, url))
                 continue
 
-    # Method 2: Filename Scanning (Fallback)
+    # Method 2: Filename Scanning
     if not candidates:
         for a in soup.find_all("a", href=True):
             href = a["href"]
