@@ -45,12 +45,11 @@ P_MOVE_TH = 1.0    # 薄いのに動く
 P_SPIKE_TH = 2.0   # 普通でも飛ぶ
 
 # 価格（yfinance）
-# 重要：^TOPX は取れない環境があるため、Yahoo日本のTOPIXコード 998405.T を採用
-TOPIX_TICKER = "998405.T"
+# 重要：TOPIXは「価格」用途のみ、1306.T（TOPIX連動ETF）で代用する。998405.Tは使用しない。
+TOPIX_TICKER = "1306.T"
 N225_TICKER = "^N225"
 
 # 日経先物（yfinance）
-# 重要：NK=F が取れない環境があるため、Yahoo Financeで取得できる NIY=F を採用
 N225_FUT_TICKER = "NIY=F"
 
 INDEX_LOOKBACK = "3y"
@@ -265,7 +264,7 @@ def fetch_yf_series(ticker: str, period: str, interval: str = "1d") -> Optional[
 
 
 def compute_topix_position() -> Dict:
-    """TOPIX（998405.T）の価格位置（PCTL×DEV200 AND）"""
+    """TOPIX（1306.T）の価格位置（PCTL×DEV200 AND）"""
     close = fetch_yf_series(TOPIX_TICKER, period=INDEX_LOOKBACK, interval="1d")
     if close is None or close.shape[0] < TOPIX_MIN_POINTS_3Y:
         return {"ok": False}
