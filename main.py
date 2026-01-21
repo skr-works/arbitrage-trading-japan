@@ -1,46 +1,61 @@
-from __future__ import annotations
+"""
+日本株市場「歪み破裂リスク検知システム」 (Distortion Burst Risk Detection)
+仕様書バージョン: 確定版
+Target Python: 3.11
+"""
 
 import json
-import os
 import re
-import time
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 import yfinance as yf
+from bs4 import BeautifulSoup
 
-# ====== 設定（仕様書準拠） ======
+# ==========================================
+# 0. 設定・定数定義 (Configuration)
+# ==========================================
+
 STATE_PATH = Path("state.json")
+MAX_HISTORY_YEARS = 5
+MAX_HISTORY_DAYS = int(245 * MAX_HISTORY_YEARS)  # 約1225日
 
-# 1. 裁定買い残の異常蓄積
-ARB_MA_DAYS = 20
-ARB_BUY_RATIO_TH = 1.5  # 平均比 1.5倍以上で警戒
-
-# 2. SQ接近
-SQ_NEAR_DAYS = 5        # 残り5日以内で警戒
-
-# 3. プライム市場全体の出来高低下
+# 閾値設定
 VOL_MA_DAYS = 20
-PRIME_VOL_RATIO_TH = 0.85 # 平均比 0.85倍以下で「薄い」と判定
 
-# 4. 指数の価格位置（高値圏）
-INDEX_TICKER = "^N225"
+# SQ設定
+SQ_NEAR_THRESHOLD = 5  # 日 (暦日)
+MAJOR_SQ_MONTHS = {3, 6, 9, 12}
+
+# 流動性不整合 (仕様書 4.3.2)
+VOL_RATIO_THIN = 0.85
+P_MOVE_TH = 1.0  # %
+P_SPIKE_TH = 2.0  # %
+
+# TOPIX位置 (仕様書 4.4.1)
 INDEX_LOOKBACK = "3y"
-INDEX_PCTL_TH = 0.90    # 上位90%点以上で高値圏
+INDEX_MIN_DATAPOINTS = 500
+PCTL_HIGH = 0.90
+DEV200_HIGH = 0.08
+PCTL_LOW = 0.10
+DEV200_LOW = -0.08
 
-# データソース
+# URL / Tickers
 URL_IRBANK = "https://irbank.net/market/arbitrage"
 URL_NIKKEI = "https://www.nikkei.com/markets/kabu/japanidx/"
+TICKER_TOPX = "^TOPX"  # TOPIX (Main)
+TICKER_N225 = "^N225"  # Nikkei 225 (Sub)
+TICKER_FUT = "NK=F"    # Nikkei 225 Futures (Sub)
 
-# User-Agent
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-
-# ====== ユーティリティ ======
+# ==========================================
+# 1. ユーティリティ (Utilities)
+# ==========================================
 
 def get_session() -> requests.Session:
     s = requests.Session()
@@ -48,73 +63,69 @@ def get_session() -> requests.Session:
     return s
 
 def parse_jp_num(s: str) -> float:
-    """日本語数値（10億4878万など）をfloat（単位：株）に変換"""
-    s = s.replace(",", "").strip()
-    if not s or s == "-" or s == "--":
+    """日本語単位（兆, 億, 万）を含む文字列を数値(float)に変換"""
+    s = str(s).replace(",", "").strip()
+    if not s or s in ["-", "--", "－"]:
         return 0.0
     
     units = {'兆': 10**12, '億': 10**8, '万': 10**4}
     total = 0.0
     current_num = ""
     
-    for char in s:
-        if char.isdigit() or char == '.':
-            current_num += char
-        elif char in units:
-            if current_num:
-                total += float(current_num) * units[char]
-                current_num = ""
-    if current_num:
-        total += float(current_num)
-    return total
+    try:
+        for char in s:
+            if char.isdigit() or char == '.':
+                current_num += char
+            elif char in units:
+                if current_num:
+                    total += float(current_num) * units[char]
+                    current_num = ""
+        if current_num:
+            total += float(current_num)
+        return total
+    except ValueError:
+        return 0.0
 
-def get_days_to_sq(base_date: date) -> int:
-    """指定日から直近のSQ（第2金曜日）までの日数を計算"""
-    y, m = base_date.year, base_date.month
+def load_state() -> Dict[str, Any]:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"history": [], "meta": {"version": 2}}
+
+def save_state(state: Dict[str, Any]):
+    if "history" in state:
+        state["history"].sort(key=lambda x: x.get("date", ""))
+        if len(state["history"]) > MAX_HISTORY_DAYS:
+            state["history"] = state["history"][-MAX_HISTORY_DAYS:]
     
-    def get_sq_date(year, month):
-        first_day = date(year, month, 1)
-        # 0=Mon, 4=Fri. (4 - weekday + 7) % 7 は「第1金曜までの日数」
-        days_to_first_fri = (4 - first_day.weekday() + 7) % 7
-        return first_day + timedelta(days=days_to_first_fri + 7) # 第2金曜
+    try:
+        STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[ERROR] Failed to save state: {e}", file=sys.stderr)
 
-    sq_date = get_sq_date(y, m)
-    
-    # すでに過ぎていれば翌月のSQ
-    if base_date > sq_date:
-        if m == 12:
-            sq_date = get_sq_date(y + 1, 1)
-        else:
-            sq_date = get_sq_date(y, m + 1)
-            
-    return (sq_date - base_date).days
+# ==========================================
+# 2. データ取得 (Data Fetching)
+# ==========================================
 
-# ====== データ取得 ======
-
-def fetch_arbitrage_data(s: requests.Session) -> Tuple[Optional[date], float, float, List[float]]:
-    """
-    IR BANKから最新の裁定買い残・売り残と、過去の買い残履歴を取得
-    Returns: (日付, 最新買い残, 最新売り残, 買い残履歴リスト)
-    """
+def fetch_irbank_arbitrage(s: requests.Session) -> Optional[Dict[str, Any]]:
+    """IRBankから裁定残高(Net)を取得"""
     try:
         r = s.get(URL_IRBANK, timeout=20)
         r.raise_for_status()
         r.encoding = r.apparent_encoding
         soup = BeautifulSoup(r.text, "html.parser")
-        
+
         header = soup.find(id="c_Shares")
-        if not header:
-            return None, 0, 0, []
-        
+        if not header: return None
         table = header.find_next("table")
-        rows = table.find_all("tr")
+        if not table: return None
         
+        rows = table.find_all("tr")
         current_year = date.today().year
-        arb_history = [] # 買い残の履歴
-        latest_data = None
         
         for row in rows:
-            # 年取得
             if "occ" in row.get("class", []):
                 td = row.find("td")
                 if td and td.text.strip().isdigit():
@@ -123,260 +134,351 @@ def fetch_arbitrage_data(s: requests.Session) -> Tuple[Optional[date], float, fl
             
             td_date = row.find("td", class_="lf")
             if not td_date: continue
-            
             cells = row.find_all("td", class_="rt")
             if len(cells) < 3: continue
             
             date_str = td_date.get_text(strip=True)
-            buy_str = cells[0].get_text(strip=True)
-            sell_str = cells[2].get_text(strip=True)
-            
-            try:
-                # 単位は「株」に戻してから「千株」にするか、そのまま扱うか。
-                # Nikkeiの売買高も「万株」単位など表記揺れがあるため、全て「単元株数(1株)」に統一して扱う。
-                buy_val = parse_jp_num(buy_str)
-                sell_val = parse_jp_num(sell_str)
-                arb_history.append(buy_val)
-                
-                # 最新行（ループの最初の方で見つかるはずだが、念のため日付チェック）
-                if "/" in date_str and latest_data is None:
-                    m, d = map(int, date_str.split("/"))
-                    dt = date(current_year, m, d)
-                    # 年またぎ補正
-                    if dt > date.today() + timedelta(days=7):
-                        dt = date(current_year - 1, m, d)
-                    latest_data = (dt, buy_val, sell_val)
-            except:
-                continue
-                
-        # 履歴は新しい順に入っているので、時系列順（古い順）になおす
-        arb_history.reverse()
-        
-        if latest_data:
-            return latest_data[0], latest_data[1], latest_data[2], arb_history
-            
-    except Exception as e:
-        print(f"[Error] IR BANK Fetch: {e}")
-        
-    return None, 0, 0, []
+            if "/" not in date_str: continue
 
-def fetch_prime_volume(s: requests.Session) -> Tuple[Optional[date], float]:
-    """
-    日経電子版から「プライム市場 売買高」を取得
-    Returns: (日付, 売買高[株])
-    """
+            try:
+                m, d = map(int, date_str.split("/"))
+                dt = date(current_year, m, d)
+                if dt > date.today() + timedelta(days=7):
+                    dt = date(current_year - 1, m, d)
+                
+                buy_val = parse_jp_num(cells[0].get_text(strip=True))
+                sell_val = parse_jp_num(cells[2].get_text(strip=True))
+                
+                if buy_val == 0.0 and sell_val == 0.0: continue
+
+                return {
+                    "date": dt.isoformat(),
+                    "arb_buy": int(buy_val),
+                    "arb_sell": int(sell_val),
+                    "arb_net": int(buy_val - sell_val)
+                }
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[WARN] IRBank fetch failed: {e}", file=sys.stderr)
+    return None
+
+def fetch_nikkei_market(s: requests.Session) -> Optional[Dict[str, Any]]:
+    """日経からプライム売買高を取得"""
     try:
         r = s.get(URL_NIKKEI, timeout=20)
         r.raise_for_status()
         r.encoding = r.apparent_encoding
         soup = BeautifulSoup(r.text, "html.parser")
         
-        # 1. 日付の特定（タイトル等から）
-        page_date = date.today()
-        h1 = soup.find("h1", class_="m-headline_text")
-        if h1:
-            # 例: "国内の株式指標・東証（20日）" -> 日付だけ抽出して現在年月と結合
-            m_text = re.search(r"（(\d+)日）", h1.text)
-            if m_text:
-                day = int(m_text.group(1))
-                # 簡易的に今月と仮定（月またぎのリスクはあるが、日経は当日か前日データ）
-                # より厳密にはフッター等の更新日時を見る
-                pass
-
-        # 2. 売買高の取得
-        # 「売買高・売買代金・騰落銘柄数」のテーブルを探す
-        # <td class="td3">216,974万株</td> のような形式
         tables = soup.find_all("table")
         for tbl in tables:
             th = tbl.find("th", string=re.compile("売買高"))
             if th:
-                # この行の「プライム」列（通常最初のtd）を取得
                 tds = th.find_parent("tr").find_all("td")
                 if tds:
-                    vol_str = tds[0].get_text(strip=True) # プライム列
+                    vol_str = tds[0].get_text(strip=True)
                     vol_val = parse_jp_num(vol_str)
-                    return page_date, vol_val
-                    
+                    if vol_val > 0:
+                        return {"prime_volume": int(vol_val)}
     except Exception as e:
-        print(f"[Error] Nikkei Fetch: {e}")
-        
-    return None, 0.0
+        print(f"[WARN] Nikkei fetch failed: {e}", file=sys.stderr)
+    return None
 
-def fetch_index_position() -> Dict:
-    """
-    YFinanceで日経平均の過去3年データを取得し、現在位置（パーセンタイル）を計算
-    """
+def fetch_yfinance_data() -> Dict[str, Any]:
+    """yfinanceから価格データを取得 (TOPIX, N225, Futures)"""
+    data = {}
+    tickers = f"{TICKER_TOPX} {TICKER_N225} {TICKER_FUT}"
     try:
-        df = yf.download(INDEX_TICKER, period=INDEX_LOOKBACK, interval="1d", progress=False)
-        if df.empty:
-            return {}
+        df = yf.download(tickers, period=INDEX_LOOKBACK, interval="1d", progress=False, auto_adjust=False)
+        if df.empty: return {}
+
+        adj_close = df["Close"] if "Close" in df else df
+        if len(adj_close) < 2: return {}
+
+        # 共通処理: 前日比計算用
+        def get_series(ticker):
+            if ticker in adj_close.columns:
+                return adj_close[ticker].dropna()
+            return None
+
+        # TOPIX
+        s_topx = get_series(TICKER_TOPX)
+        if s_topx is not None:
+            data["topx_history"] = s_topx
+            data["topx_latest"] = float(s_topx.iloc[-1])
+            data["topx_prev"] = float(s_topx.iloc[-2])
+            # 前日比%
+            data["topx_chg_pct"] = ((data["topx_latest"] / data["topx_prev"]) - 1) * 100
+
+        # N225 (補助)
+        s_n225 = get_series(TICKER_N225)
+        if s_n225 is not None:
+            data["n225_latest"] = float(s_n225.iloc[-1])
+            data["n225_prev"] = float(s_n225.iloc[-2])
+            data["n225_chg_pct"] = ((data["n225_latest"] / data["n225_prev"]) - 1) * 100
+            data["n225_history"] = s_n225 # Basis計算用
+
+        # Futures (Basis)
+        s_fut = get_series(TICKER_FUT)
+        if s_fut is not None:
+            data["fut_history"] = s_fut
+
+    except Exception as e:
+        print(f"[WARN] yfinance fetch failed: {e}", file=sys.stderr)
+    
+    return data
+
+# ==========================================
+# 3. ロジック & 判定 (Logic & Evaluation)
+# ==========================================
+
+class MarketAnalyzer:
+    def __init__(self, state: Dict[str, Any], ir_data: Optional[Dict], nk_data: Optional[Dict], yf_data: Dict):
+        self.state = state
+        self.ir_data = ir_data
+        self.nk_data = nk_data
+        self.yf_data = yf_data
         
-        # Series化
-        close = df["Close"]
-        if isinstance(close, pd.DataFrame):
-            close = close.iloc[:, 0]
-        close = close.dropna()
-        
-        latest_price = float(close.iloc[-1])
-        # ランク計算 (0.0 - 1.0)
-        rank = (close < latest_price).mean()
-        
-        return {
-            "latest_price": latest_price,
-            "percentile": rank,
-            "threshold": close.quantile(INDEX_PCTL_TH),
-            "is_high_zone": rank >= INDEX_PCTL_TH
+        self.today = date.today()
+        self.result = {
+            "date": self.today.isoformat(),
+            "level": "INFO", # Default
+            "conditions": {},
+            "metrics": {}
         }
-    except Exception as e:
-        print(f"[Error] YFinance Fetch: {e}")
-        return {}
 
-# ====== 状態管理 ======
+    def update_state(self) -> bool:
+        """データ更新・保存判定 (仕様書 3.3)"""
+        if not self.ir_data or not self.nk_data:
+            print("[INFO] Data missing. Skip.")
+            return False
 
-def load_state() -> Dict:
-    if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except:
-            pass
-    return {"history": []}
+        data_date_str = self.ir_data["date"]
+        data_date = date.fromisoformat(data_date_str)
+        
+        if data_date > self.today: return False
+        
+        hist = self.state["history"]
+        if hist:
+            last = hist[-1]
+            if last.get("date") == data_date_str:
+                # 同値チェック
+                if (last.get("arb_net") == self.ir_data["arb_net"] and 
+                    last.get("prime_volume") == self.nk_data["prime_volume"]):
+                    print(f"[INFO] Data for {data_date_str} unchanged. Skip.")
+                    return False
+                else:
+                    hist.pop() # 更新のため削除
 
-def save_state(state: Dict):
-    try:
-        STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        print(f"[Error] Save State: {e}")
+        record = {
+            "date": data_date_str,
+            "arb_buy": self.ir_data["arb_buy"],
+            "arb_sell": self.ir_data["arb_sell"],
+            "arb_net": self.ir_data["arb_net"],
+            "prime_volume": self.nk_data["prime_volume"]
+        }
+        hist.append(record)
+        return True
 
-def update_volume_history(state: Dict, dt: date, vol: float):
-    """プライム出来高を履歴に追加（MA計算用）"""
-    ds = dt.isoformat()
-    hist = state["history"]
-    
-    # 既存データの更新確認
-    found = False
-    for r in hist:
-        if r["date"] == ds:
-            r["prime_volume"] = vol
-            found = True
-            break
-    if not found:
-        hist.append({"date": ds, "prime_volume": vol})
-    
-    # ソートして最新20日+αを残す
-    hist.sort(key=lambda x: x["date"])
-    if len(hist) > 100: # バッファを持たせて保持
-        state["history"] = hist[-100:]
+    def _get_history_df(self) -> pd.DataFrame:
+        df = pd.DataFrame(self.state["history"])
+        if not df.empty and "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
+        return df
 
-def get_volume_ma(state: Dict, window: int) -> Optional[float]:
-    hist = state["history"]
-    vols = [r["prime_volume"] for r in hist if "prime_volume" in r and r["prime_volume"] > 0]
-    
-    if len(vols) < window:
-        return None # データ不足
-    
-    # 直近window個の平均
-    recent = vols[-window:]
-    return sum(recent) / len(recent)
+    def evaluate(self):
+        df = self._get_history_df()
+        if df.empty: return
 
-# ====== メインロジック ======
+        latest = df.iloc[-1]
+        
+        # --- 4.1 裁定残高ロジック (ARB_STUCK) ---
+        arb_stuck = False
+        delta3, delta5, delta25 = 0, 0, 0
+        
+        if len(df) >= 26:
+            curr = latest["arb_net"]
+            delta3 = curr - df["arb_net"].iloc[-4] # t-3 (index -4)
+            delta5 = curr - df["arb_net"].iloc[-6]
+            delta25 = curr - df["arb_net"].iloc[-26]
+            
+            # 定義: Δ5 >= 0 かつ Δ25 > 0
+            if delta5 >= 0 and delta25 > 0:
+                arb_stuck = True
+        
+        # --- 4.2 SQロジック ---
+        d2sq = self._calc_days_to_sq(self.today)
+        sq_month = (self.today + timedelta(days=d2sq)).month
+        is_major_sq = sq_month in MAJOR_SQ_MONTHS
+        
+        # 条件: D2SQ <= 5 かつ メジャーSQ
+        major_sq_near = (d2sq <= SQ_NEAR_THRESHOLD) and is_major_sq
+
+        # --- 4.3 流動性ロジック (LIQ_MISMATCH) ---
+        liq_mismatch = False
+        vol_ratio = 0.0
+        px_move = 0.0
+        
+        if len(df) >= VOL_MA_DAYS and "prime_volume" in latest:
+            # MA20
+            vol_ma = df["prime_volume"].iloc[-VOL_MA_DAYS:].mean()
+            vol_ratio = latest["prime_volume"] / vol_ma
+            
+            # 変動率 (TOPIX優先, なければN225)
+            if "topx_chg_pct" in self.yf_data:
+                px_move = abs(self.yf_data["topx_chg_pct"])
+            elif "n225_chg_pct" in self.yf_data:
+                px_move = abs(self.yf_data["n225_chg_pct"])
+            
+            # 不整合判定
+            # 1. 薄いのに動く
+            cond1 = (vol_ratio <= 0.85) and (px_move >= P_MOVE_TH)
+            # 2. 普通なのに飛ぶ
+            cond2 = (vol_ratio > 0.85) and (px_move >= P_SPIKE_TH)
+            
+            if cond1 or cond2:
+                liq_mismatch = True
+
+        # --- 4.4 価格ロジック ---
+        idx_high_topix = False
+        basis_stuck = False
+        pctl, dev200 = 0.0, 0.0
+        
+        # A) TOPIX位置
+        if "topx_history" in self.yf_data:
+            s = self.yf_data["topx_history"]
+            if len(s) >= INDEX_MIN_DATAPOINTS:
+                curr = self.yf_data["topx_latest"]
+                # PCTL
+                pctl = (s < curr).mean()
+                # DEV200
+                ma200 = s.rolling(200).mean().iloc[-1]
+                if ma200 > 0:
+                    dev200 = (curr / ma200) - 1
+                    
+                    # 高値圏: PCTL >= 0.90 AND DEV200 >= +0.08
+                    if pctl >= PCTL_HIGH and dev200 >= DEV200_HIGH:
+                        idx_high_topix = True
+
+        # B) 裁定ストレス (Basis)
+        if "n225_history" in self.yf_data and "fut_history" in self.yf_data:
+            # 直近5営業日のBasis絶対値推移
+            s_n225 = self.yf_data["n225_history"]
+            s_fut = self.yf_data["fut_history"]
+            common = s_n225.index.intersection(s_fut.index)
+            if len(common) >= 5:
+                # 日付アライメント
+                basis_series = (s_fut.loc[common] - s_n225.loc[common]).abs().tail(5)
+                # "縮小しない" 判定 (簡易実装: 傾きが非負、または平均より最新が大きい)
+                # ここでは「最新値 >= 期間平均」を「縮まっていない」とみなす
+                if basis_series.iloc[-1] >= basis_series.mean():
+                    basis_stuck = True
+
+        # --- 5. 総合判定 (仕様書 5.1, 5.2) ---
+        
+        # 価格側の補助条件 (いずれか必須)
+        price_condition = idx_high_topix or basis_stuck
+        
+        # WARNING (LEVEL 3)
+        # 1. ARB_STUCK
+        # 2. MAJOR_SQ_NEAR
+        # 3. LIQ_MISMATCH
+        # 4. PRICE_CONDITION
+        is_warning = arb_stuck and major_sq_near and liq_mismatch and price_condition
+        
+        # CAUTION (LEVEL 2)
+        # ARB_STUCK + LIQ_MISMATCH + (SQ or Price)
+        is_caution = arb_stuck and liq_mismatch and (major_sq_near or price_condition)
+        
+        level = "LEVEL 1: NORMAL"
+        if is_warning:
+            level = "LEVEL 3: WARNING"
+        elif is_caution:
+            level = "LEVEL 2: CAUTION"
+
+        self.result.update({
+            "level": level,
+            "conditions": {
+                "ARB_STUCK": arb_stuck,
+                "MAJOR_SQ_NEAR": major_sq_near,
+                "LIQ_MISMATCH": liq_mismatch,
+                "IDX_HIGH_TOPIX": idx_high_topix,
+                "BASIS_STUCK_NK": basis_stuck
+            },
+            "metrics": {
+                "arb_net": int(latest["arb_net"]),
+                "delta3": int(delta3),
+                "delta5": int(delta5),
+                "delta25": int(delta25),
+                "days_to_sq": d2sq,
+                "vol_ratio": round(vol_ratio, 2),
+                "px_move": round(px_move, 2),
+                "pctl": round(pctl, 2),
+                "dev200": round(dev200, 3)
+            }
+        })
+
+    def _calc_days_to_sq(self, base_date: date) -> int:
+        y, m = base_date.year, base_date.month
+        def get_2nd_fri(yr, mo):
+            first = date(yr, mo, 1)
+            # 0=Mon, 4=Fri
+            return first + timedelta(days=((4 - first.weekday() + 7) % 7) + 7)
+        
+        sq = get_2nd_fri(y, m)
+        if base_date > sq:
+            if m == 12: sq = get_2nd_fri(y + 1, 1)
+            else: sq = get_2nd_fri(y, m + 1)
+        return (sq - base_date).days
+
+    def report(self):
+        r = self.result
+        c = r["conditions"]
+        m = r["metrics"]
+        
+        print("=" * 60)
+        print(f"日本株市場 構造歪み検知レポート (Date: {r['date']})")
+        print(f"判定: {r['level']}")
+        print("-" * 60)
+        print(f"[1] 裁定スタック (ARB_STUCK): {c['ARB_STUCK']}")
+        print(f"    Net: {m.get('arb_net'):,} / Δ5: {m.get('delta5'):,} / Δ25: {m.get('delta25'):,}")
+        print(f"    (Δ3: {m.get('delta3'):,})")
+        
+        print(f"[2] メジャーSQ接近 (MAJOR_SQ_NEAR): {c['MAJOR_SQ_NEAR']}")
+        print(f"    残り {m.get('days_to_sq')} 日")
+        
+        print(f"[3] 流動性不整合 (LIQ_MISMATCH): {c['LIQ_MISMATCH']}")
+        print(f"    Vol比: {m.get('vol_ratio')}倍 / 変動率: {m.get('px_move')}%")
+        
+        print(f"[4] 価格/乖離 (PRICE_COND): {c['IDX_HIGH_TOPIX'] or c['BASIS_STUCK_NK']}")
+        print(f"    TOPIX高値圏: {c['IDX_HIGH_TOPIX']} (PCTL: {m.get('pctl')}, DEV200: {m.get('dev200')})")
+        print(f"    Basis是正不能: {c['BASIS_STUCK_NK']}")
+        print("=" * 60)
+
+# ==========================================
+# 4. Main
+# ==========================================
 
 def main():
-    print("=== 日本株市場「構造歪み・急変リスク検知システム」 ===")
     s = get_session()
+    
+    # データ取得
+    ir_data = fetch_irbank_arbitrage(s)
+    nk_data = fetch_nikkei_market(s)
+    yf_data = fetch_yfinance_data()
+    
+    # 判定
     state = load_state()
+    analyzer = MarketAnalyzer(state, ir_data, nk_data, yf_data)
     
-    # 1. データ取得
-    arb_date, arb_buy, arb_sell, arb_hist = fetch_arbitrage_data(s)
-    vol_date, prime_vol = fetch_prime_volume(s)
-    idx_info = fetch_index_position()
-    
-    # 出来高履歴の更新
-    if vol_date and prime_vol > 0:
-        update_volume_history(state, vol_date, prime_vol)
-        save_state(state) # データを確保
-    
-    # 日付チェック
-    today = date.today()
-    report_dt = arb_date if arb_date else today
-    
-    # ====== 判定ロジック ======
-    
-    # ① 裁定買い残の異常蓄積
-    cond_arb_hot = False
-    arb_ratio = 0.0
-    if arb_buy > 0 and len(arb_hist) >= ARB_MA_DAYS:
-        # IR BANKから取得した履歴でMA計算
-        # histは古い順。直近20個の平均
-        ma_arb = sum(arb_hist[-ARB_MA_DAYS:]) / ARB_MA_DAYS
-        arb_ratio = arb_buy / ma_arb
-        cond_arb_hot = (arb_ratio >= ARB_BUY_RATIO_TH)
-    
-    # ② SQ接近
-    d2sq = get_days_to_sq(report_dt)
-    cond_sq_near = (d2sq <= SQ_NEAR_DAYS)
-    
-    # ③ プライム市場全体の出来高低下
-    cond_vol_thin = False
-    vol_ratio = 0.0
-    vol_ma = get_volume_ma(state, VOL_MA_DAYS)
-    
-    if vol_ma and prime_vol > 0:
-        vol_ratio = prime_vol / vol_ma
-        cond_vol_thin = (vol_ratio <= PRIME_VOL_RATIO_TH)
+    if analyzer.update_state():
+        save_state(state)
+        analyzer.evaluate()
+        analyzer.report()
     else:
-        # 初回実行時などで履歴がない場合は判定不能（Falseとする）
-        # ※「判定思想」に基づき、条件が揃わない限りアラートは出さない
-        pass 
-
-    # ④ 指数の価格位置（高値圏）
-    cond_idx_high = idx_info.get("is_high_zone", False)
-    
-    # ====== 総合判定 ======
-    # 「構造 × 時間 × 流動性 × 価格位置」が 同時成立したか
-    # データ不足(None)の項目はFalse扱いとなるため安全側に倒れる
-    alert_triggered = cond_arb_hot and cond_sq_near and cond_vol_thin and cond_idx_high
-    
-    # LEVEL判定
-    true_count = sum([cond_arb_hot, cond_sq_near, cond_vol_thin, cond_idx_high])
-    
-    if alert_triggered:
-        level = "LEVEL 3: WARNING (警戒)"
-        msg = "構造・時間・流動性・価格の全条件が成立。市場は壊れやすい状態です。\n新規投入抑制、ポジション縮小を推奨。"
-    elif true_count >= 2:
-        level = "LEVEL 2: CAUTION (注意)"
-        msg = "複数の歪みが観測されています。レバレッジや一括エントリーは避けてください。"
-    else:
-        level = "LEVEL 1: NORMAL (正常)"
-        msg = "構造的な危機シグナルは点灯していません。通常運用可能です。"
-
-    # ====== レポート出力 ======
-    print(f"\n[判定結果] {level}")
-    print(msg)
-    print("-" * 40)
-    
-    print("1. 裁定買い残の異常蓄積")
-    print(f"   現在: {arb_buy/100000000:.2f}億株 (MA20比: {arb_ratio:.2f}倍)")
-    print(f"   判定: {cond_arb_hot} (閾値 {ARB_BUY_RATIO_TH}倍以上)")
-    
-    print("\n2. SQ接近")
-    print(f"   残り日数: {d2sq}日")
-    print(f"   判定: {cond_sq_near} (閾値 {SQ_NEAR_DAYS}日以内)")
-    
-    print("\n3. プライム出来高低下 (流動性)")
-    if vol_ma:
-        print(f"   現在: {prime_vol/100000000:.2f}億株 (MA20比: {vol_ratio:.2f}倍)")
-        print(f"   判定: {cond_vol_thin} (閾値 {PRIME_VOL_RATIO_TH}倍以下)")
-    else:
-        print(f"   現在: {prime_vol/100000000:.2f}億株")
-        print("   判定: データ不足のため保留 (state.jsonに蓄積中)")
-
-    print("\n4. 指数高値圏")
-    pctl = idx_info.get('percentile', 0) * 100
-    print(f"   現在位置: {pctl:.1f}%点 (過去3年分布)")
-    print(f"   判定: {cond_idx_high} (閾値 {int(INDEX_PCTL_TH*100)}%以上)")
-    
-    print("=" * 40)
-    print(f"ALERT_VOLATILITY_RISK = {alert_triggered}")
+        print("No update required.")
 
 if __name__ == "__main__":
     main()
