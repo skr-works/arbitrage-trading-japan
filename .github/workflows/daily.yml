@@ -28,6 +28,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Monitor Script
+        env:
+          SRC_A_URL: ${{ secrets.SRC_A_URL }}
+          SRC_B_URL: ${{ secrets.SRC_B_URL }}
         run: python main.py
 
       - name: Commit and Push state
