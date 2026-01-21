@@ -1,9 +1,3 @@
-"""
-日本株市場「歪み破裂リスク検知システム」 (Distortion Burst Risk Detection)
-仕様書バージョン: 確定版
-Target Python: 3.11
-"""
-
 import json
 import re
 import sys
