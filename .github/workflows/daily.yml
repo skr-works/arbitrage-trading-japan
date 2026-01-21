@@ -1,9 +1,9 @@
 name: Market Structure Monitor
 
 on:
-  # 平日の 15:31 JST (UTC 06:31) に実行（大引け後）
+  # 平日の 20:13 JST (UTC 11:13) に実行（大引け後）
   schedule:
-    - cron: '31 6 * * 1-5'
+    - cron: '13 11 * * 1-5'
   # 手動実行も可能にする
   workflow_dispatch:
 
