@@ -27,11 +27,10 @@ UA = (
 )
 
 # state.json 保持期間（5年）
-# 日本の営業日概算：245/年 → 5年で約1225。余裕を見て 1400。
-STATE_MAX_RECORDS = 1400
+STATE_MAX_RECORDS = 1400  # 245営業日/年 ×5=1225 なので余裕を持たせる
 
 # SQ
-SQ_NEAR_DAYS = 5  # カレンダー日でOK（運用は営業日で回す前提）
+SQ_NEAR_DAYS = 5
 MAJOR_SQ_MONTHS = {3, 6, 9, 12}
 
 # 裁定ネット残（ARB_NET = BUY - SELL）の営業日差分
@@ -39,31 +38,30 @@ ARB_DELTA_SHORT = 3
 ARB_DELTA_MAIN = 5
 ARB_DELTA_LONG = 25
 
-# ARB_STUCK 判定（必須条件）
-# Δ5 >= 0 かつ Δ25 > 0
-# Δ3 >= 0 は早期警戒（INFO加点）
-# ※「差分の符号」で判定（絶対値閾値に依存しない）
-# 閾値は不要
-
-# 出来高不整合（プライム売買高MA20 + TOPIX(メイン)/N225(フォールバック) 前日比%）
+# 出来高不整合
 VOL_MA_DAYS = 20
 VOL_RATIO_THIN = 0.85
-P_MOVE_TH = 1.0    # 薄いのに動く：|Δ%| >= 1.0
-P_SPIKE_TH = 2.0   # 普通でも飛ぶ：|Δ%| >= 2.0
+P_MOVE_TH = 1.0    # 薄いのに動く
+P_SPIKE_TH = 2.0   # 普通でも飛ぶ
 
-# TOPIX 価格位置（甘い仕様禁止：PCTL×DEV200のAND）
-TOPIX_TICKER = "^TOPX"
+# 価格（yfinance）
+# 重要：^TOPX は取れない環境があるため、Yahoo日本のTOPIXコード 998405.T を採用
+TOPIX_TICKER = "998405.T"
 N225_TICKER = "^N225"
-NK_FUT_TICKER = "NK=F"
+
+# 日経先物（yfinance）
+# 重要：NK=F が取れない環境があるため、Yahoo Financeで取得できる NIY=F を採用
+N225_FUT_TICKER = "NIY=F"
+
 INDEX_LOOKBACK = "3y"
 TOPIX_PCTL_HIGH = 0.90
 TOPIX_PCTL_LOW = 0.10
-TOPIX_DEV200_TH = 0.08  # +8% / -8%
+TOPIX_DEV200_TH = 0.08
 TOPIX_MIN_POINTS_3Y = 500
 
-# 日経先物−現物（裁定ストレス補助）
-BASIS_LOOKBACK_DAYS = 10
-BASIS_SHRINK_WINDOW = 5  # 営業日5本前と比較（縮小しない＝横ばい〜拡大）
+# 先物−現物（縮小しない＝ストレス）
+BASIS_LOOKBACK_DAYS = 20
+BASIS_SHRINK_WINDOW = 5
 
 
 # =========================
@@ -114,7 +112,7 @@ def get_days_to_sq(base_date: date) -> int:
     def get_sq_date(year: int, month: int) -> date:
         first = date(year, month, 1)
         days_to_first_fri = (4 - first.weekday() + 7) % 7
-        return first + timedelta(days=days_to_first_fri + 7)  # 第2金曜
+        return first + timedelta(days=days_to_first_fri + 7)
 
     sq = get_sq_date(y, m)
     if base_date > sq:
@@ -130,10 +128,7 @@ def is_major_sq_month(d: date) -> bool:
 
 
 def safe_pct_change(series: pd.Series) -> Optional[float]:
-    """
-    直近2点から前日比%（絶対値ではなく符号付き）を返す。
-    取得不能なら None。
-    """
+    """直近2点から前日比%（符号付き）を返す。取得不能なら None。"""
     if series is None or series.dropna().shape[0] < 2:
         return None
     s = series.dropna()
@@ -171,7 +166,6 @@ def fetch_arbitrage_data(s: requests.Session) -> Tuple[Optional[date], Optional[
         latest_data: Optional[Tuple[date, float, float]] = None
 
         for row in rows:
-            # 年行
             if "occ" in row.get("class", []):
                 td = row.find("td")
                 if td and td.text.strip().isdigit():
@@ -198,19 +192,17 @@ def fetch_arbitrage_data(s: requests.Session) -> Tuple[Optional[date], Optional[
             net_val = float(buy_val - sell_val)
             net_hist_newest_first.append(net_val)
 
-            # 最新行
             if "/" in date_str and latest_data is None:
                 try:
                     mm, dd = map(int, date_str.split("/"))
                     dt = date(current_year, mm, dd)
-                    # 年またぎ補正（未来日なら前年扱い）
                     if dt > date.today() + timedelta(days=7):
                         dt = date(current_year - 1, mm, dd)
                     latest_data = (dt, float(buy_val), float(sell_val))
                 except Exception:
                     pass
 
-        net_hist_newest_first.reverse()  # 古→新
+        net_hist_newest_first.reverse()
 
         if latest_data:
             return latest_data[0], latest_data[1], latest_data[2], net_hist_newest_first
@@ -222,10 +214,7 @@ def fetch_arbitrage_data(s: requests.Session) -> Tuple[Optional[date], Optional[
 
 
 def fetch_prime_volume(s: requests.Session) -> Tuple[Optional[date], Optional[float]]:
-    """
-    日経電子版から「プライム市場 売買高」を取得
-    Returns: (日付, 売買高[株]) 取得できない場合は (None, None)
-    """
+    """日経電子版から「プライム市場 売買高」を取得。取れないなら (None, None)。"""
     try:
         r = s.get(URL_NIKKEI, timeout=20)
         r.raise_for_status()
@@ -246,7 +235,7 @@ def fetch_prime_volume(s: requests.Session) -> Tuple[Optional[date], Optional[fl
             if not tds:
                 continue
 
-            vol_str = tds[0].get_text(strip=True)  # プライム列が最初である前提
+            vol_str = tds[0].get_text(strip=True)
             vol_val = parse_jp_num(vol_str)
             if vol_val is None:
                 return None, None
@@ -259,9 +248,7 @@ def fetch_prime_volume(s: requests.Session) -> Tuple[Optional[date], Optional[fl
 
 
 def fetch_yf_series(ticker: str, period: str, interval: str = "1d") -> Optional[pd.Series]:
-    """
-    yfinanceから終値Seriesを取得。失敗したらNone。
-    """
+    """yfinanceから終値Seriesを取得。失敗したらNone。"""
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False)
         if df is None or df.empty:
@@ -278,27 +265,15 @@ def fetch_yf_series(ticker: str, period: str, interval: str = "1d") -> Optional[
 
 
 def compute_topix_position() -> Dict:
-    """
-    TOPIX（^TOPX）の価格位置（PCTL×DEV200 AND）を計算
-    - PCTL: 過去3年終値分布でのpercentile rank
-    - DEV200: MA200乖離
-    Returns:
-      {
-        latest_price, pctl, dev200,
-        idx_high_topix, idx_low_topix,
-        ok (bool),
-      }
-    """
+    """TOPIX（998405.T）の価格位置（PCTL×DEV200 AND）"""
     close = fetch_yf_series(TOPIX_TICKER, period=INDEX_LOOKBACK, interval="1d")
     if close is None or close.shape[0] < TOPIX_MIN_POINTS_3Y:
         return {"ok": False}
 
     latest = float(close.iloc[-1])
 
-    # Percentile rank (0..1)
     pctl = float((close < latest).mean())
 
-    # MA200
     if close.shape[0] < 200:
         return {"ok": False}
     ma200 = float(close.rolling(200).mean().iloc[-1])
@@ -320,17 +295,13 @@ def compute_topix_position() -> Dict:
 
 
 def compute_daily_move_pct() -> Dict:
-    """
-    出来高不整合のための前日比%（TOPIXメイン、ダメならN225）
-    Returns:
-      { "source": "TOPIX"|"N225"|None, "pct": float|None, "ok": bool }
-    """
-    topix_close = fetch_yf_series(TOPIX_TICKER, period="7d", interval="1d")
+    """前日比%（TOPIXメイン、ダメならN225）"""
+    topix_close = fetch_yf_series(TOPIX_TICKER, period="10d", interval="1d")
     pct = safe_pct_change(topix_close) if topix_close is not None else None
     if pct is not None:
         return {"ok": True, "source": "TOPIX", "pct": float(pct)}
 
-    n225_close = fetch_yf_series(N225_TICKER, period="7d", interval="1d")
+    n225_close = fetch_yf_series(N225_TICKER, period="10d", interval="1d")
     pct = safe_pct_change(n225_close) if n225_close is not None else None
     if pct is not None:
         return {"ok": True, "source": "N225", "pct": float(pct)}
@@ -340,25 +311,21 @@ def compute_daily_move_pct() -> Dict:
 
 def compute_basis_stuck_nk() -> Dict:
     """
-    日経225先物(NK=F) − 日経平均(^N225) の乖離が「5営業日前より縮小していない」かを判定
-    Returns:
-      { "ok": bool, "basis_today": float|None, "basis_5ago": float|None, "stuck": bool }
+    日経先物（NIY=F）−日経平均（^N225）が「5営業日前より縮小していない」か
     """
-    nk = fetch_yf_series(NK_FUT_TICKER, period=f"{BASIS_LOOKBACK_DAYS}d", interval="1d")
-    n225 = fetch_yf_series(N225_TICKER, period=f"{BASIS_LOOKBACK_DAYS}d", interval="1d")
-    if nk is None or n225 is None:
+    fut = fetch_yf_series(N225_FUT_TICKER, period=f"{BASIS_LOOKBACK_DAYS}d", interval="1d")
+    spot = fetch_yf_series(N225_TICKER, period=f"{BASIS_LOOKBACK_DAYS}d", interval="1d")
+    if fut is None or spot is None:
         return {"ok": False}
 
-    # 日付で揃える（終値Seriesのindexを揃えて差分）
-    df = pd.DataFrame({"nk": nk, "n225": n225}).dropna()
+    df = pd.DataFrame({"fut": fut, "spot": spot}).dropna()
     if df.shape[0] < (BASIS_SHRINK_WINDOW + 1):
         return {"ok": False}
 
-    basis = df["nk"] - df["n225"]
+    basis = df["fut"] - df["spot"]
     basis_today = float(basis.iloc[-1])
     basis_5ago = float(basis.iloc[-(BASIS_SHRINK_WINDOW + 1)])
 
-    # 仕様：絶対値が縮小していない（横ばい〜拡大）なら True
     stuck = abs(basis_today) >= abs(basis_5ago)
 
     return {
@@ -391,26 +358,11 @@ def save_state(state: Dict) -> None:
         print(f"[Error] Save state: {e}")
 
 
-def get_last_saved_date(state: Dict) -> Optional[str]:
-    hist = state.get("history", [])
-    if not hist:
-        return None
-    # history は date昇順で持つ
-    return hist[-1].get("date")
-
-
 def update_volume_history(state: Dict, dt: date, vol: float) -> bool:
-    """
-    プライム出来高を履歴に追加（5年保持）。
-    非取引日/更新なし対策：
-      - 同日が既にある場合は上書き（値が同じならno-op扱い）
-    Returns:
-      state更新したらTrue、更新なしならFalse
-    """
+    """プライム出来高を履歴に追加（5年保持）。同日同値なら更新しない。"""
     ds = dt.isoformat()
     hist = state["history"]
 
-    # 既存日付なら更新
     for r in hist:
         if r.get("date") == ds:
             old = r.get("prime_volume")
@@ -419,11 +371,9 @@ def update_volume_history(state: Dict, dt: date, vol: float) -> bool:
             r["prime_volume"] = vol
             return True
 
-    # 新規追加
     hist.append({"date": ds, "prime_volume": vol})
     hist.sort(key=lambda x: x.get("date", ""))
 
-    # 5年保持（上限で切る）
     if len(hist) > STATE_MAX_RECORDS:
         state["history"] = hist[-STATE_MAX_RECORDS:]
     return True
@@ -431,7 +381,11 @@ def update_volume_history(state: Dict, dt: date, vol: float) -> bool:
 
 def get_volume_ma(state: Dict, window: int) -> Optional[float]:
     hist = state.get("history", [])
-    vols = [r["prime_volume"] for r in hist if isinstance(r.get("prime_volume"), (int, float)) and r["prime_volume"] > 0]
+    vols = [
+        r["prime_volume"]
+        for r in hist
+        if isinstance(r.get("prime_volume"), (int, float)) and r["prime_volume"] > 0
+    ]
     if len(vols) < window:
         return None
     recent = vols[-window:]
@@ -463,22 +417,17 @@ def main():
     move_info = compute_daily_move_pct()
     basis_info = compute_basis_stuck_nk()
 
-    # 基準日（営業日運用の想定：arb_date優先、なければ今日）
     today = date.today()
     report_dt = arb_date if arb_date else today
 
     # 2) 非取引日/更新なし対策（保存と判定）
-    # - 日経出来高が取れていない/0なら保存しない
-    # - 同日値で更新なしなら保存しない
     state_updated = False
     if vol_date and isinstance(prime_vol, (int, float)) and prime_vol and prime_vol > 0:
         state_updated = update_volume_history(state, vol_date, float(prime_vol))
         if state_updated:
             save_state(state)
 
-    # 重要：非取引日に「前回値が返る」可能性がある。
-    # ここでは「出来高が取得できておらず、arb_dateも無い」等の場合は判定しない。
-    # ただしarb_dateが取れているなら営業日の可能性が高いので判定は続行する。
+    # IRBankも日経も取れないなら「判定しない」
     if arb_date is None and (vol_date is None or prime_vol is None):
         print("\n[INFO] データ更新が確認できないため、本日は判定をスキップします（非取引日/取得失敗の可能性）。")
         return
@@ -509,8 +458,8 @@ def main():
     if vol_ma is not None and isinstance(prime_vol, (int, float)) and prime_vol and prime_vol > 0 and move_info.get("ok"):
         vol_ratio = float(prime_vol) / float(vol_ma)
         px_move_src = move_info.get("source")
-        px_move_abs = abs(float(move_info.get("pct")))  # %
-        # 不整合の確定ルール
+        px_move_abs = abs(float(move_info.get("pct")))
+
         if (vol_ratio <= VOL_RATIO_THIN and px_move_abs >= P_MOVE_TH) or (vol_ratio > VOL_RATIO_THIN and px_move_abs >= P_SPIKE_TH):
             liq_mismatch = True
 
@@ -519,14 +468,10 @@ def main():
     topix_pctl = float(topix_pos.get("pctl")) if topix_pos.get("ok") and "pctl" in topix_pos else None
     topix_dev200 = float(topix_pos.get("dev200")) if topix_pos.get("ok") and "dev200" in topix_pos else None
 
-    # 7) 裁定ストレス補助（日経先物−現物が縮まらない）
+    # 7) 裁定ストレス補助（先物−現物が縮まらない）
     basis_stuck_nk = bool(basis_info.get("stuck")) if basis_info.get("ok") else False
 
     # 8) 総合判定（仕様確定）
-    # WARNING:
-    #   ARB_STUCK かつ MAJOR_SQ_NEAR かつ LIQ_MISMATCH かつ (IDX_HIGH_TOPIX または BASIS_STUCK_NK)
-    # CAUTION:
-    #   ARB_STUCK かつ LIQ_MISMATCH かつ (MAJOR_SQ_NEAR または IDX_HIGH_TOPIX または BASIS_STUCK_NK)
     warning = arb_stuck and major_sq_near and liq_mismatch and (idx_high_topix or basis_stuck_nk)
     caution = (not warning) and arb_stuck and liq_mismatch and (major_sq_near or idx_high_topix or basis_stuck_nk)
 
@@ -566,9 +511,12 @@ def main():
     if vol_ma is None or prime_vol is None:
         print("   データ不足（state.json蓄積中 or 日経取得失敗）")
     else:
-        print(f"   プライム売買高: {float(prime_vol)/1e8:.2f}億株 / MA20: {float(vol_ma)/1e8:.2f}億株 / 比率: {vol_ratio:.2f}" if vol_ratio is not None else
-              f"   プライム売買高: {float(prime_vol)/1e8:.2f}億株 / MA20: {float(vol_ma)/1e8:.2f}億株")
-    if move_info.get("ok"):
+        if vol_ratio is not None:
+            print(f"   プライム売買高: {float(prime_vol)/1e8:.2f}億株 / MA20: {float(vol_ma)/1e8:.2f}億株 / 比率: {vol_ratio:.2f}")
+        else:
+            print(f"   プライム売買高: {float(prime_vol)/1e8:.2f}億株 / MA20: {float(vol_ma)/1e8:.2f}億株")
+
+    if px_move_abs is not None:
         print(f"   価格変動(|前日比%|): {px_move_abs:.2f}%（ソース: {px_move_src}）")
     else:
         print("   価格変動: 取得失敗（yfinance）")
@@ -576,17 +524,19 @@ def main():
 
     print("\nD) TOPIX 価格位置（PCTL×DEV200 AND）")
     if topix_pos.get("ok"):
+        print(f"   ティッカー: {TOPIX_TICKER}")
         print(f"   PCTL(3y): {topix_pctl*100:.1f}%点 / DEV200: {topix_dev200*100:.2f}%")
         print(f"   IDX_HIGH_TOPIX: {idx_high_topix}")
     else:
-        print("   TOPIX位置: データ不足/取得失敗（False扱い）")
+        print(f"   TOPIX位置: データ不足/取得失敗（ティッカー: {TOPIX_TICKER}）")
 
     print("\nE) 裁定ストレス補助（日経先物−現物が縮まらない）")
     if basis_info.get("ok"):
+        print(f"   先物ティッカー: {N225_FUT_TICKER} / 現物: {N225_TICKER}")
         print(f"   BASIS 今日: {basis_info['basis_today']:.2f} / 5営業日前: {basis_info['basis_5ago']:.2f}")
-        print(f"   BASIS_STUCK_NK: {basis_stuck_nk}")
+        print(f"   BASIS_STUCK: {basis_stuck_nk}")
     else:
-        print("   BASIS: 取得失敗/データ不足（False扱い）")
+        print(f"   BASIS: 取得失敗/データ不足（先物ティッカー: {N225_FUT_TICKER}）")
 
     print("\nF) state.json")
     print(f"   更新: {state_updated} / 保持件数: {len(state.get('history', []))} / 上限: {STATE_MAX_RECORDS}")
