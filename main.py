@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os  # 追加（URLを環境変数から受け取る）
 import re
 from datetime import date, timedelta
 from pathlib import Path
@@ -10,6 +11,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import yfinance as yf
+import jpholiday  # 追加（祝日停止）
 
 # =========================
 # 設定（仕様書準拠・確定版）
@@ -17,9 +19,9 @@ import yfinance as yf
 
 STATE_PATH = Path("state.json")
 
-# データソース（JPXは絶対に使わない）
-URL_IRBANK = "https://irbank.net/market/arbitrage"
-URL_NIKKEI = "https://www.nikkei.com/markets/kabu/japanidx/"
+# 入力（URLは環境変数から注入。コード上に直書きしない）
+SRC_A_URL = os.environ.get("SRC_A_URL", "").strip()
+SRC_B_URL = os.environ.get("SRC_B_URL", "").strip()
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -138,17 +140,36 @@ def safe_pct_change(series: pd.Series) -> Optional[float]:
     return (last / prev - 1.0) * 100.0
 
 
+def is_market_closed(d: date) -> bool:
+    """
+    停止条件：
+      - 土日
+      - 国民の祝日（jpholiday）
+      - 12/31〜1/3（固定停止）
+    """
+    if d.weekday() >= 5:
+        return True
+    if (d.month == 12 and d.day == 31) or (d.month == 1 and d.day in (1, 2, 3)):
+        return True
+    if jpholiday.is_holiday(d):
+        return True
+    return False
+
+
 # =========================
 # データ取得
 # =========================
 
 def fetch_arbitrage_data(s: requests.Session) -> Tuple[Optional[date], Optional[float], Optional[float], List[float]]:
     """
-    IRBankから最新の裁定買い残・売り残、過去の裁定ネット残（買い−売り）履歴を取得
+    SRC_A から、最新の買い残・売り残と、過去のネット残（買い−売り）履歴を取得
     Returns: (最新日付, 最新買い残, 最新売り残, ネット残履歴[古→新])
     """
+    if not SRC_A_URL:
+        return None, None, None, []
+
     try:
-        r = s.get(URL_IRBANK, timeout=20)
+        r = s.get(SRC_A_URL, timeout=20)
         r.raise_for_status()
         r.encoding = r.apparent_encoding
         soup = BeautifulSoup(r.text, "html.parser")
@@ -207,15 +228,18 @@ def fetch_arbitrage_data(s: requests.Session) -> Tuple[Optional[date], Optional[
             return latest_data[0], latest_data[1], latest_data[2], net_hist_newest_first
 
     except Exception as e:
-        print(f"[Error] IRBank fetch: {e}")
+        print(f"[Error] SRC_A fetch: {e}")
 
     return None, None, None, []
 
 
 def fetch_prime_volume(s: requests.Session) -> Tuple[Optional[date], Optional[float]]:
-    """日経電子版から「プライム市場 売買高」を取得。取れないなら (None, None)。"""
+    """SRC_B から「プライム市場 売買高」を取得。取れないなら (None, None)。"""
+    if not SRC_B_URL:
+        return None, None
+
     try:
-        r = s.get(URL_NIKKEI, timeout=20)
+        r = s.get(SRC_B_URL, timeout=20)
         r.raise_for_status()
         r.encoding = r.apparent_encoding
         soup = BeautifulSoup(r.text, "html.parser")
@@ -241,7 +265,7 @@ def fetch_prime_volume(s: requests.Session) -> Tuple[Optional[date], Optional[fl
             return page_date, float(vol_val)
 
     except Exception as e:
-        print(f"[Error] Nikkei fetch: {e}")
+        print(f"[Error] SRC_B fetch: {e}")
 
     return None, None
 
@@ -405,10 +429,19 @@ def calc_delta(net_hist: List[float], lag: int) -> Optional[float]:
 def main():
     print("=== 日本株市場「歪み破裂リスク検知システム（仕様確定版）」 ===")
 
+    today = date.today()
+    if is_market_closed(today):
+        print(f"\n[INFO] 休場日のため停止します（判定・保存ともに実施しません）: {today.isoformat()}")
+        return
+
+    if not SRC_A_URL or not SRC_B_URL:
+        print("\n[INFO] 入力が未設定のため停止します（SRC_A_URL / SRC_B_URL）")
+        return
+
     s = get_session()
     state = load_state()
 
-    # 1) データ取得（IRBank / 日経 / yfinance）
+    # 1) データ取得（SRC_A / SRC_B / yfinance）
     arb_date, arb_buy, arb_sell, arb_net_hist = fetch_arbitrage_data(s)
     vol_date, prime_vol = fetch_prime_volume(s)
 
@@ -416,7 +449,6 @@ def main():
     move_info = compute_daily_move_pct()
     basis_info = compute_basis_stuck_nk()
 
-    today = date.today()
     report_dt = arb_date if arb_date else today
 
     # 2) 非取引日/更新なし対策（保存と判定）
@@ -426,9 +458,9 @@ def main():
         if state_updated:
             save_state(state)
 
-    # IRBankも日経も取れないなら「判定しない」
+    # SRC_AもSRC_Bも取れないなら「判定しない」
     if arb_date is None and (vol_date is None or prime_vol is None):
-        print("\n[INFO] データ更新が確認できないため、本日は判定をスキップします（非取引日/取得失敗の可能性）。")
+        print("\n[INFO] データ更新が確認できないため、本日は判定をスキップします（取得失敗の可能性）。")
         return
 
     # 3) 裁定ネット残ロジック（Δ3/Δ5/Δ25）
@@ -492,7 +524,7 @@ def main():
     print(msg)
     print("-" * 50)
 
-    print("A) 裁定ネット残（IRBank）")
+    print("A) 裁定ネット残（SRC_A）")
     if arb_buy is not None and arb_sell is not None:
         arb_net_latest = arb_buy - arb_sell
         print(f"   最新 BUY: {arb_buy/1e8:.2f}億株 / SELL: {arb_sell/1e8:.2f}億株 / NET: {arb_net_latest/1e8:.2f}億株")
@@ -508,7 +540,7 @@ def main():
 
     print("\nC) 流動性の質（出来高×価格変動 不整合）")
     if vol_ma is None or prime_vol is None:
-        print("   データ不足（state.json蓄積中 or 日経取得失敗）")
+        print("   データ不足（state.json蓄積中 or 取得失敗）")
     else:
         if vol_ratio is not None:
             print(f"   プライム売買高: {float(prime_vol)/1e8:.2f}億株 / MA20: {float(vol_ma)/1e8:.2f}億株 / 比率: {vol_ratio:.2f}")
