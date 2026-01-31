@@ -64,6 +64,27 @@ TOPIX_MIN_POINTS_3Y = 500
 BASIS_LOOKBACK_DAYS = 20
 BASIS_SHRINK_WINDOW = 5
 
+# -------------------------
+# 追加：修正仕様（MARGIN / EMERGENCY）
+# -------------------------
+
+# ARB MARGIN：比率 + FLOOR
+ARB_MARGIN_5_RATIO = 0.005   # m5=0.5%
+ARB_MARGIN_25_RATIO = 0.010  # m25=1.0%
+ARB_FLOOR_5_MED_RATIO = 0.001   # FLOOR_5 = median * 0.1%
+ARB_FLOOR_25_MED_RATIO = 0.002  # FLOOR_25 = median * 0.2%
+
+# ARB高水準：直近ウィンドウ（1y相当=245本、足りなければ6m相当=126本）
+ARB_PCTL_YEAR_POINTS = 245
+ARB_PCTL_HALF_POINTS = 126
+ARB_HIGH_PCTL = 0.80
+
+# EMERGENCY：q=0.99 と固定3%のmax
+EMERGENCY_FIXED_TH = 3.0
+EMERGENCY_Q = 0.99
+MOVE_LOOKBACK = "1y"
+MOVE_MIN_POINTS = 60  # 少なすぎる分位は不安定なので最低限
+
 
 # =========================
 # ユーティリティ
@@ -154,6 +175,83 @@ def is_market_closed(d: date) -> bool:
     if jpholiday.is_holiday(d):
         return True
     return False
+
+
+# -------------------------
+# 追加：ARB統計（分位・中央値・MARGIN）
+# -------------------------
+
+def _arb_window(net_hist: List[float]) -> Optional[List[float]]:
+    if not net_hist:
+        return None
+    if len(net_hist) >= ARB_PCTL_YEAR_POINTS:
+        return net_hist[-ARB_PCTL_YEAR_POINTS:]
+    if len(net_hist) >= ARB_PCTL_HALF_POINTS:
+        return net_hist[-ARB_PCTL_HALF_POINTS:]
+    return None
+
+
+def compute_arb_stats(net_hist: List[float], arb_net_latest: float) -> Optional[Dict]:
+    """
+    ARBの分位・中央値・MARGINを返す。
+    - pctl: 直近値がウィンドウ内でどの位置か（< latest の比率）
+    - med_abs: ウィンドウ内の |net| の中央値（FLOOR用）
+    - margin_5 / margin_25: 比率 + FLOOR
+    """
+    w = _arb_window(net_hist)
+    if w is None:
+        return None
+
+    s = pd.Series(w).dropna()
+    if s.empty:
+        return None
+
+    latest = float(arb_net_latest)
+    pctl = float((s < latest).mean())
+
+    med_abs = float(pd.Series([abs(float(x)) for x in s.tolist()]).median())
+    floor_5 = med_abs * ARB_FLOOR_5_MED_RATIO
+    floor_25 = med_abs * ARB_FLOOR_25_MED_RATIO
+
+    base = abs(latest)
+    margin_5 = max(base * ARB_MARGIN_5_RATIO, floor_5)
+    margin_25 = max(base * ARB_MARGIN_25_RATIO, floor_25)
+
+    return {
+        "pctl": pctl,
+        "arb_high": bool(pctl >= ARB_HIGH_PCTL),
+        "med_abs": med_abs,
+        "floor_5": float(floor_5),
+        "floor_25": float(floor_25),
+        "margin_5": float(margin_5),
+        "margin_25": float(margin_25),
+        "window_n": int(s.shape[0]),
+    }
+
+
+# -------------------------
+# 追加：EMERGENCY閾値（q=0.99）
+# -------------------------
+
+def compute_move_abs_q99() -> Optional[float]:
+    """
+    |前日比%| の分布（直近1y）から q=0.99 閾値を返す。
+    TOPIX(1306.T)優先、無理ならN225。
+    """
+    close = fetch_yf_series(TOPIX_TICKER, period=MOVE_LOOKBACK, interval="1d")
+    if close is None or close.dropna().shape[0] < MOVE_MIN_POINTS:
+        close = fetch_yf_series(N225_TICKER, period=MOVE_LOOKBACK, interval="1d")
+        if close is None or close.dropna().shape[0] < MOVE_MIN_POINTS:
+            return None
+
+    c = close.dropna().astype(float)
+    pct = c.pct_change() * 100.0
+    abs_pct = pct.abs().dropna()
+    if abs_pct.shape[0] < MOVE_MIN_POINTS:
+        return None
+
+    q = float(abs_pct.quantile(EMERGENCY_Q))
+    return q
 
 
 # =========================
@@ -335,6 +433,7 @@ def compute_daily_move_pct() -> Dict:
 def compute_basis_stuck_nk() -> Dict:
     """
     日経先物（NIY=F）−日経平均（^N225）が「5営業日前より縮小していない」か
+    （修正：下落警戒の符号重視フラグ basis_stress_down を追加）
     """
     fut = fetch_yf_series(N225_FUT_TICKER, period=f"{BASIS_LOOKBACK_DAYS}d", interval="1d")
     spot = fetch_yf_series(N225_TICKER, period=f"{BASIS_LOOKBACK_DAYS}d", interval="1d")
@@ -350,12 +449,14 @@ def compute_basis_stuck_nk() -> Dict:
     basis_5ago = float(basis.iloc[-(BASIS_SHRINK_WINDOW + 1)])
 
     stuck = abs(basis_today) >= abs(basis_5ago)
+    basis_stress_down = (basis_today < 0) and (basis_today <= basis_5ago)
 
     return {
         "ok": True,
         "basis_today": basis_today,
         "basis_5ago": basis_5ago,
         "stuck": bool(stuck),
+        "basis_stress_down": bool(basis_stress_down),
     }
 
 
@@ -449,7 +550,8 @@ def main():
     move_info = compute_daily_move_pct()
     basis_info = compute_basis_stuck_nk()
 
-    report_dt = arb_date if arb_date else today
+    # 修正：判定日を arb_date > vol_date > today の優先順で決める
+    report_dt = arb_date if arb_date else (vol_date if vol_date else today)
 
     # 2) 非取引日/更新なし対策（保存と判定）
     state_updated = False
@@ -458,30 +560,80 @@ def main():
         if state_updated:
             save_state(state)
 
-    # SRC_AもSRC_Bも取れないなら「判定しない」
-    if arb_date is None and (vol_date is None or prime_vol is None):
-        print("\n[INFO] データ更新が確認できないため、本日は判定をスキップします（取得失敗の可能性）。")
+    # 修正：判定不能（INSUFFICIENT）を導入（欠損をNORMALに落とさない）
+    insufficient_reasons: List[str] = []
+
+    # 必須：ARB（最新BUY/SELLとΔ5計算と分位窓）
+    if arb_buy is None or arb_sell is None:
+        insufficient_reasons.append("ARB: 最新BUY/SELLが取得不能")
+    d5 = calc_delta(arb_net_hist, ARB_DELTA_MAIN)
+    if d5 is None:
+        insufficient_reasons.append("ARB: Δ5が計算不能（履歴不足）")
+
+    # 必須：出来高（当日値とMA20）
+    vol_ma = get_volume_ma(state, VOL_MA_DAYS)
+    if prime_vol is None or not isinstance(prime_vol, (int, float)) or not prime_vol or prime_vol <= 0:
+        insufficient_reasons.append("VOL: プライム売買高が取得不能")
+    if vol_ma is None:
+        insufficient_reasons.append("VOL: MA20が計算不能（state.json履歴不足）")
+
+    # 必須：価格変動（当日）
+    if not move_info.get("ok"):
+        insufficient_reasons.append("PX: 前日比%が取得不能（yfinance）")
+
+    # 必須：EMERGENCY分位（q=0.99）
+    q99_move = compute_move_abs_q99()
+    if q99_move is None:
+        insufficient_reasons.append("EMERGENCY: q=0.99閾値が算出不能（履歴不足/取得失敗）")
+
+    # report_dtが確定できないケース（念のため）
+    if report_dt is None:
+        insufficient_reasons.append("DATE: report_dtが確定不能")
+
+    if insufficient_reasons:
+        print(f"\n[判定日] {today.isoformat()}")
+        print("[判定結果] LEVEL 0: INSUFFICIENT (判定不能)")
+        print("必要データが揃わないため、本日は判定しません。")
+        print("-" * 50)
+        for r in insufficient_reasons:
+            print(f" - {r}")
+        print("=" * 50)
+        print("ALERT_VOLATILITY_RISK = False")
         return
 
-    # 3) 裁定ネット残ロジック（Δ3/Δ5/Δ25）
+    # 3) 裁定ネット残ロジック（Δ3/Δ5/Δ25） ※d5は上で計算済み
     d3 = calc_delta(arb_net_hist, ARB_DELTA_SHORT)
-    d5 = calc_delta(arb_net_hist, ARB_DELTA_MAIN)
     d25 = calc_delta(arb_net_hist, ARB_DELTA_LONG)
 
-    arb_stuck = False
+    arb_net_latest = float(arb_buy - arb_sell)
+
+    arb_stats = compute_arb_stats(arb_net_hist, arb_net_latest)
+    if arb_stats is None or d25 is None:
+        print(f"\n[判定日] {report_dt.isoformat()}")
+        print("[判定結果] LEVEL 0: INSUFFICIENT (判定不能)")
+        print("ARB統計（分位/中央値/MARGIN）またはΔ25が計算できないため、本日は判定しません。")
+        print("=" * 50)
+        print("ALERT_VOLATILITY_RISK = False")
+        return
+
+    # 修正：ARB_STUCKをWEAK/STRONGに分割（MARGIN比率＋FLOOR）
+    margin_5 = float(arb_stats["margin_5"])
+    margin_25 = float(arb_stats["margin_25"])
+    arb_high = bool(arb_stats["arb_high"])
+
+    arb_stuck_weak = (d5 >= -margin_5)
+    arb_stuck_strong = (d5 >= -margin_5) and (d25 >= -margin_25) and arb_high
+
     arb_info_boost = False
-    if d5 is not None and d25 is not None:
-        arb_stuck = (d5 >= 0) and (d25 > 0)
     if d3 is not None:
         arb_info_boost = (d3 >= 0)
 
-    # 4) SQ（メジャーSQ接近を重視）
+    # 4) SQ（メジャーSQ接近を重視） ※修正：必須ではなくブーストに使う
     d2sq = get_days_to_sq(report_dt)
     major_sq_near = (d2sq <= SQ_NEAR_DAYS) and is_major_sq_month(report_dt)
 
     # 5) 流動性の質低下（出来高×価格変動の不整合）
     liq_mismatch = False
-    vol_ma = get_volume_ma(state, VOL_MA_DAYS)
     vol_ratio = None
     px_move_abs = None
     px_move_src = None
@@ -499,19 +651,48 @@ def main():
     topix_pctl = float(topix_pos.get("pctl")) if topix_pos.get("ok") and "pctl" in topix_pos else None
     topix_dev200 = float(topix_pos.get("dev200")) if topix_pos.get("ok") and "dev200" in topix_pos else None
 
-    # 7) 裁定ストレス補助（先物−現物が縮まらない）
+    # 7) 裁定ストレス補助（先物−現物）
     basis_stuck_nk = bool(basis_info.get("stuck")) if basis_info.get("ok") else False
+    basis_stress_down = bool(basis_info.get("basis_stress_down")) if basis_info.get("ok") else False
 
-    # 8) 総合判定（仕様確定）
-    warning = arb_stuck and major_sq_near and liq_mismatch and (idx_high_topix or basis_stuck_nk)
-    caution = (not warning) and arb_stuck and liq_mismatch and (major_sq_near or idx_high_topix or basis_stuck_nk)
+    # 8) EMERGENCY（q=0.99 と固定3%のmax）
+    em_th = max(float(EMERGENCY_FIXED_TH), float(q99_move))
+    emergency_move = (px_move_abs is not None) and (float(px_move_abs) >= em_th)
+
+    # 9) 総合判定（修正）
+    # WARNING:
+    #   A) ARB_STRONG × LIQ × (IDX_HIGH or BASIS_STRESS_DOWN)
+    #   B) ARB_WEAK × LIQ × EMERGENCY（SQ不要）
+    warning = (
+        (arb_stuck_strong and liq_mismatch and (idx_high_topix or basis_stress_down))
+        or (arb_stuck_weak and liq_mismatch and emergency_move)
+    )
+
+    # CAUTION:
+    #   ARB（WEAK/STRONG）× LIQ × (SQ or IDX_HIGH or BASIS_STRESS_DOWN or EMERGENCY)
+    caution = (
+        (not warning)
+        and (arb_stuck_weak or arb_stuck_strong)
+        and liq_mismatch
+        and (major_sq_near or idx_high_topix or basis_stress_down or emergency_move)
+    )
+
+    # 修正：SQブースト（CAUTION かつ major_sq_near なら WARNING に格上げ）
+    sq_boosted = False
+    if caution and major_sq_near:
+        warning = True
+        caution = False
+        sq_boosted = True
 
     if warning:
         level = "LEVEL 3: WARNING (警戒)"
-        msg = "裁定の是正不全×メジャーSQ接近×流動性不整合が同時成立。市場が壊れやすい環境です。"
+        if sq_boosted:
+            msg = "裁定×流動性不整合が成立し、メジャーSQ接近により警戒へ格上げ。市場が壊れやすい環境です。"
+        else:
+            msg = "裁定×流動性不整合の条件が強く成立。市場が壊れやすい環境です。"
     elif caution:
         level = "LEVEL 2: CAUTION (注意)"
-        msg = "裁定の是正不全と流動性不整合が観測。イベント要因次第で荒れやすい状態です。"
+        msg = "裁定の歪みと流動性不整合が観測。イベント要因次第で荒れやすい状態です。"
     else:
         level = "LEVEL 1: NORMAL (正常)"
         msg = "歪み破裂リスクの主要条件は成立していません。"
@@ -525,30 +706,26 @@ def main():
     print("-" * 50)
 
     print("A) 裁定ネット残（SRC_A）")
-    if arb_buy is not None and arb_sell is not None:
-        arb_net_latest = arb_buy - arb_sell
-        print(f"   最新 BUY: {arb_buy/1e8:.2f}億株 / SELL: {arb_sell/1e8:.2f}億株 / NET: {arb_net_latest/1e8:.2f}億株")
-    else:
-        print("   最新 BUY/SELL: 取得失敗")
+    print(f"   最新 BUY: {arb_buy/1e8:.2f}億株 / SELL: {arb_sell/1e8:.2f}億株 / NET: {arb_net_latest/1e8:.2f}億株")
     print(f"   Δ{ARB_DELTA_SHORT}: {d3 if d3 is not None else 'N/A'}  (INFO加点={arb_info_boost})")
     print(f"   Δ{ARB_DELTA_MAIN}:  {d5 if d5 is not None else 'N/A'}")
     print(f"   Δ{ARB_DELTA_LONG}: {d25 if d25 is not None else 'N/A'}")
-    print(f"   ARB_STUCK(必須): {arb_stuck}")
+    print(f"   ARB_PCTL(window_n={arb_stats['window_n']}): {arb_stats['pctl']:.3f} / ARB_HIGH: {arb_high}")
+    print(f"   MARGIN_5: {margin_5:.0f} / MARGIN_25: {margin_25:.0f}")
+    print(f"   ARB_STUCK_WEAK: {arb_stuck_weak} / ARB_STUCK_STRONG: {arb_stuck_strong}")
 
-    print("\nB) SQ（メジャーSQ重視）")
+    print("\nB) SQ（メジャーSQはブースト要因）")
     print(f"   D2SQ: {d2sq}日 / メジャーSQ月: {is_major_sq_month(report_dt)} / MAJOR_SQ_NEAR: {major_sq_near}")
 
     print("\nC) 流動性の質（出来高×価格変動 不整合）")
-    if vol_ma is None or prime_vol is None:
-        print("   データ不足（state.json蓄積中 or 取得失敗）")
+    if vol_ratio is not None:
+        print(f"   プライム売買高: {float(prime_vol)/1e8:.2f}億株 / MA20: {float(vol_ma)/1e8:.2f}億株 / 比率: {vol_ratio:.2f}")
     else:
-        if vol_ratio is not None:
-            print(f"   プライム売買高: {float(prime_vol)/1e8:.2f}億株 / MA20: {float(vol_ma)/1e8:.2f}億株 / 比率: {vol_ratio:.2f}")
-        else:
-            print(f"   プライム売買高: {float(prime_vol)/1e8:.2f}億株 / MA20: {float(vol_ma)/1e8:.2f}億株")
+        print("   データ不足（state.json蓄積中 or 取得失敗）")
 
     if px_move_abs is not None:
         print(f"   価格変動(|前日比%|): {px_move_abs:.2f}%（ソース: {px_move_src}）")
+        print(f"   EMERGENCY_TH: max({EMERGENCY_FIXED_TH:.1f}%, q99={q99_move:.2f}%) = {em_th:.2f}% / EMERGENCY_MOVE: {emergency_move}")
     else:
         print("   価格変動: 取得失敗（yfinance）")
     print(f"   LIQ_MISMATCH: {liq_mismatch}")
@@ -561,11 +738,11 @@ def main():
     else:
         print(f"   TOPIX位置: データ不足/取得失敗（ティッカー: {TOPIX_TICKER}）")
 
-    print("\nE) 裁定ストレス補助（日経先物−現物が縮まらない）")
+    print("\nE) 裁定ストレス補助（日経先物−現物）")
     if basis_info.get("ok"):
         print(f"   先物ティッカー: {N225_FUT_TICKER} / 現物: {N225_TICKER}")
         print(f"   BASIS 今日: {basis_info['basis_today']:.2f} / 5営業日前: {basis_info['basis_5ago']:.2f}")
-        print(f"   BASIS_STUCK: {basis_stuck_nk}")
+        print(f"   BASIS_STUCK: {basis_stuck_nk} / BASIS_STRESS_DOWN: {basis_stress_down}")
     else:
         print(f"   BASIS: 取得失敗/データ不足（先物ティッカー: {N225_FUT_TICKER}）")
 
