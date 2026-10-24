@@ -1,6 +1,7 @@
-pandas>=2.0.0
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-yfinance>=0.2.36
-lxml>=4.9.0
+pandas
+requests
+beautifulsoup4
+yfinance
+lxml
 jpholiday
+certifi>=2026.10.19
